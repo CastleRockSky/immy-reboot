@@ -1,0 +1,11 @@
+# Claude Code per-project settings
+.claude/
+
+# IDEs
+.vs/
+.vscode/
+*.user
+
+# OS junk
+Thumbs.db
+.DS_Store

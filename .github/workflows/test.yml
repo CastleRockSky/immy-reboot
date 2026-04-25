@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run prompt tests
+        shell: powershell
+        run: .\tests\test-prompt.ps1
+
+      - name: Run maintenance tests
+        shell: powershell
+        run: .\tests\test-maintenance.ps1
+
+      - name: Verify dist is up to date with sources
+        shell: powershell
+        run: |
+          .\build.ps1
+          $diff = git status --porcelain dist/immy-reboot-maintenance.ps1
+          if ($diff) {
+            Write-Host "dist/immy-reboot-maintenance.ps1 is out of date with sources." -ForegroundColor Red
+            Write-Host "Run .\build.ps1 locally and commit the result." -ForegroundColor Red
+            git diff dist/immy-reboot-maintenance.ps1
+            exit 1
+          }
+          Write-Host "dist is up to date." -ForegroundColor Green
+
+      - name: Parse-check dist
+        shell: powershell
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\dist\immy-reboot-maintenance.ps1),
+            [ref]$null, [ref]$errors)
+          if ($errors -and $errors.Count) {
+            $errors | ForEach-Object { Write-Host "  L$($_.Extent.StartLineNumber): $($_.Message)" }
+            exit 1
+          }
