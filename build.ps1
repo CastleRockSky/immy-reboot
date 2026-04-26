@@ -43,7 +43,12 @@ if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 }
 
-Set-Content -Path $distPath -Value $built -Encoding UTF8
+# Write UTF-8 without BOM, regardless of PowerShell version. PS 5.1's
+# Set-Content -Encoding UTF8 emits a BOM; PS 7+'s does not. CI and dev
+# need to produce byte-identical output, so pin it explicitly via .NET.
+# Trailing LF matches what Set-Content/Out-File added by default.
+$builtWithEol = $built.TrimEnd("`r","`n") + "`n"
+[System.IO.File]::WriteAllText($distPath, $builtWithEol, (New-Object System.Text.UTF8Encoding $false))
 
 $lineCount = ($built -split "`n").Count
 Write-Host "Built: $distPath ($lineCount lines, $($built.Length) chars)" -ForegroundColor Green

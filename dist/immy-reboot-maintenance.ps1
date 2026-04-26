@@ -630,4 +630,3 @@ foreach ($u in $users) {
 }
 
 Write-Host "Pending reboot detected. Prompt task registered for $($users.Count) user(s)."
-
