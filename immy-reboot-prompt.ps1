@@ -174,6 +174,14 @@ if ($scheduleOptions.Count -eq 0) {
     }
 }
 
+# Optional branding row. WPF auto-fetches Source URLs at render time, so the
+# endpoint just needs network reachability to wherever the image is hosted.
+$brandImageElement = ''
+if ($config.BrandImageUrl) {
+    $escapedUrl = [System.Security.SecurityElement]::Escape([string]$config.BrandImageUrl)
+    $brandImageElement = "<Image Grid.Row=`"0`" Source=`"$escapedUrl`" Height=`"60`" HorizontalAlignment=`"Center`" Margin=`"0,0,0,16`"/>"
+}
+
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -190,15 +198,17 @@ if ($scheduleOptions.Count -eq 0) {
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Name="MessageText" TextWrapping="Wrap" MaxWidth="440" Margin="0,0,0,12" FontSize="14"/>
-        <TextBlock Grid.Row="1" Name="CountdownText" HorizontalAlignment="Center" FontWeight="Bold" FontSize="14" Margin="0,0,0,8"/>
-        <TextBlock Grid.Row="2" Name="DeferralStatus" HorizontalAlignment="Center" Foreground="#666" Margin="0,0,0,16" TextWrapping="Wrap"/>
-        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,16">
+        $brandImageElement
+        <TextBlock Grid.Row="1" Name="MessageText" TextWrapping="Wrap" MaxWidth="440" Margin="0,0,0,12" FontSize="14"/>
+        <TextBlock Grid.Row="2" Name="CountdownText" HorizontalAlignment="Center" FontWeight="Bold" FontSize="14" Margin="0,0,0,8"/>
+        <TextBlock Grid.Row="3" Name="DeferralStatus" HorizontalAlignment="Center" Foreground="#666" Margin="0,0,0,16" TextWrapping="Wrap"/>
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,16">
             <TextBlock Text="Schedule reboot for: " VerticalAlignment="Center" Margin="0,0,8,0"/>
             <ComboBox Name="ScheduleTime" Width="120"/>
         </StackPanel>
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Center">
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Center">
             <Button Name="ScheduleBtn"  Content="Schedule Reboot" Width="130" Height="32" Margin="0,0,8,0"/>
             <Button Name="RebootNowBtn" Content="Reboot Now"      Width="110" Height="32" Margin="0,0,8,0"/>
             <Button Name="PostponeBtn"  Content="Postpone"        Width="100" Height="32"/>

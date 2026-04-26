@@ -22,6 +22,9 @@
 #   $minRebootHour            - earliest schedulable hour, 24h (default 22)
 #   $promptTitle              - window title (default "Restart Required")
 #   $promptMessage            - body text shown to the user
+#   $brandImageUrl            - optional logo URL shown above the message;
+#                               must be reachable from the endpoint. Empty =
+#                               no image (default).
 #   $stagingFolder            - where prompt + config are staged
 #                               (default C:\ProgramData\RebootPrompt)
 #   $verboseDiagnostics       - log language modes + extra detail to the
@@ -34,6 +37,7 @@ if ($null -eq $autoRebootAfterSeconds)   { $autoRebootAfterSeconds = 600 }
 if ($null -eq $minRebootHour)            { $minRebootHour = 22 }
 if (-not $promptTitle)                   { $promptTitle = "Restart Required" }
 if (-not $promptMessage)                 { $promptMessage = "Updates have been installed and your computer needs to restart. Please save your work and choose an option below." }
+if ($null -eq $brandImageUrl)            { $brandImageUrl = "" }
 if (-not $stagingFolder)                 { $stagingFolder = "C:\ProgramData\RebootPrompt" }
 if ($null -eq $verboseDiagnostics)       { $verboseDiagnostics = $false }
 
@@ -283,6 +287,7 @@ $config = @{
     PostponeIntervalHours  = [int]$postponeIntervalHours
     MaxDefers              = [int]$maxDefers
     SentinelPath           = $sentinelPath
+    BrandImageUrl          = $brandImageUrl
 }
 
 Save-PromptStaging -ScriptDestination $promptScriptPath -ConfigDestination $configPath -Config $config

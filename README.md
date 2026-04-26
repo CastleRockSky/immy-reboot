@@ -73,6 +73,7 @@ new dist into ImmyBot.
 | `$minRebootHour`          | `22` (10 PM)                       | Earliest hour shown in the schedule dropdown.         |
 | `$promptTitle`            | `"Restart Required"`               | Window title.                                         |
 | `$promptMessage`          | _(generic update message)_         | Body text shown to the user.                          |
+| `$brandImageUrl`          | `""`                               | Optional logo URL shown above the message. Must be reachable from the endpoint; empty disables the image. |
 | `$stagingFolder`          | `"C:\ProgramData\RebootPrompt"`    | Where the prompt script and config are staged.        |
 | `$verboseDiagnostics`     | `$false`                           | Log language modes and extra detail to the maintenance session log. |
 
