@@ -58,16 +58,13 @@ __INLINED_PROMPT_HERE__
 function Test-PendingReboot {
     # Runs on the endpoint. Without the Invoke-ImmyCommand wrapper, Test-Path
     # would probe the ImmyBot backend's registry instead of the target's.
+    # Only CBS and WU are checked: PendingFileRenameOperations is too noisy in
+    # the wild (Chrome / OneDrive / AV updates routinely set it without the
+    # user actually needing to reboot), so we'd nag people for non-events.
     Invoke-ImmyCommand -Context System -ScriptBlock {
         $cbs = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         $wu  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-        $pfro = $false
-        try {
-            $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
-                -Name PendingFileRenameOperations -ErrorAction Stop
-            if ($sm.PendingFileRenameOperations) { $pfro = $true }
-        } catch { }
-        return ($cbs -or $wu -or $pfro)
+        return ($cbs -or $wu)
     }
 }
 
@@ -231,9 +228,11 @@ function Register-RebootPromptTask {
     Write-Host "Registered scheduled task '$taskName' for $userPrincipal."
 }
 
-# Test escape: tests dot-source this script with $immyRebootMaintenanceTestMode = $true
-# to get the helper functions defined without running the body.
-if ($immyRebootMaintenanceTestMode) { return }
+# Test/dot-source escape: tests dot-source this script (with or without
+# $immyRebootMaintenanceTestMode) to get the helper functions defined
+# without running the body. Dot-source detection is the structural
+# guarantee; the variable is kept for explicit invoke-style overrides.
+if ($MyInvocation.InvocationName -eq '.' -or $immyRebootMaintenanceTestMode) { return }
 
 # -------------------------------------------------------------------------
 # Main flow
@@ -251,6 +250,26 @@ if ($verboseDiagnostics) {
         Write-Host "Could not probe endpoint LanguageMode: $($_.Exception.Message)"
     }
 }
+
+# Reconcile orphaned scheduled tasks. The user-context prompt can't
+# unregister tasks that this script registered as SYSTEM, so it drops a
+# 'cleanup-requested-<username>' sentinel and we do the unregister here.
+# Failures are swallowed: if the task has already been removed manually,
+# the sentinel is still cleared so we don't retry forever.
+Invoke-ImmyCommand -Context System -ScriptBlock {
+    $folder = $using:stagingFolder
+    if (-not (Test-Path $folder)) { return }
+    $sentinels = Get-ChildItem -Path $folder -Filter 'cleanup-requested-*' -File -ErrorAction SilentlyContinue
+    foreach ($sentinel in $sentinels) {
+        $username = $sentinel.Name -replace '^cleanup-requested-', ''
+        $taskName = "$($using:taskNamePrefix)-$username"
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+            Write-Output "Unregistered orphaned task '$taskName'."
+        } catch { }
+        Remove-Item -Path $sentinel.FullName -Force -ErrorAction SilentlyContinue
+    }
+} | ForEach-Object { Write-Host $_ }
 
 # Reboot sentinel: if a prompt's user-context shutdown.exe failed (typically
 # SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.

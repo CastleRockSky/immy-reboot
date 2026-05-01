@@ -71,30 +71,21 @@ $inlinedPromptScript = @'
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string]$ConfigPath,
-    [Parameter(Mandatory)] [string]$TaskName
+    [string]$ConfigPath,
+    [string]$TaskName
 )
 
 $ErrorActionPreference = 'Stop'
 
-# Cheap diagnostics: leave a transcript on disk so a silent failure isn't
-# guesswork. Per-user filename to avoid clobbering on multi-user hosts.
-try {
-    Start-Transcript -Path "C:\ProgramData\RebootPrompt\last-run-$env:USERNAME.log" -Force -ErrorAction SilentlyContinue | Out-Null
-} catch { }
-
 # -------------------------------------------------------------------------
 
 function Test-PendingReboot {
+    # Only CBS + WU. PendingFileRenameOperations is excluded - it's set by
+    # routine Chrome / OneDrive / AV updates that don't actually require a
+    # user-visible reboot, and tripping on those just nags people.
     $cbs = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
     $wu  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    $pfro = $false
-    try {
-        $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
-            -Name PendingFileRenameOperations -ErrorAction Stop
-        if ($sm.PendingFileRenameOperations) { $pfro = $true }
-    } catch { }
-    return ($cbs -or $wu -or $pfro)
+    return ($cbs -or $wu)
 }
 
 $deferStateRegPath = 'HKCU:\Software\RebootPrompt'
@@ -134,6 +125,20 @@ function Remove-SelfTask {
     } catch { }
 }
 
+function Save-CleanupSentinel {
+    # The user-context Unregister-ScheduledTask call in Remove-SelfTask
+    # silently fails because the task was registered as SYSTEM and the user
+    # lacks rights to remove it. Drop a breadcrumb here that the next
+    # SYSTEM-context maintenance pass picks up to do the actual cleanup.
+    # File name carries the username so per-user tasks can be identified.
+    $sentinel = Join-Path 'C:\ProgramData\RebootPrompt' "cleanup-requested-$env:USERNAME"
+    try {
+        $dir = Split-Path $sentinel -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -Path $sentinel -Value (Get-Date).ToString('o') -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
+
 function Invoke-RebootRequest {
     # Tries shutdown.exe in the user's context. If the user lacks SeShutdown-
     # Privilege (typically GPO-stripped on hardened endpoints), drop a sentinel
@@ -162,8 +167,23 @@ function Invoke-RebootRequest {
     return @{ Success = $false; Output = ($output -join [Environment]::NewLine) }
 }
 
-# Test escape for unit tests.
-if ($immyRebootPromptTestMode) { return }
+# Test/dot-source escape. Sits before any side effects (transcript, param
+# validation, UI) so a test harness that dot-sources this file - even one
+# that forgets to set $immyRebootPromptTestMode - never reaches the WPF
+# window. The dot-source check is the structural guarantee; the variable is
+# kept as an explicit override for invoke-style harnesses.
+if ($MyInvocation.InvocationName -eq '.' -or $immyRebootPromptTestMode) { return }
+
+if (-not $ConfigPath -or -not $TaskName) {
+    Write-Host "immy-reboot-prompt.ps1 requires -ConfigPath and -TaskName."
+    exit 1
+}
+
+# Cheap diagnostics: leave a transcript on disk so a silent failure isn't
+# guesswork. Per-user filename to avoid clobbering on multi-user hosts.
+try {
+    Start-Transcript -Path "C:\ProgramData\RebootPrompt\last-run-$env:USERNAME.log" -Force -ErrorAction SilentlyContinue | Out-Null
+} catch { }
 
 # -------------------------------------------------------------------------
 # Pre-checks
@@ -180,6 +200,7 @@ $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 # the task and exit. Also reset the per-user defer count for next cycle.
 if (-not (Test-PendingReboot)) {
     Clear-DeferralState
+    Save-CleanupSentinel
     Remove-SelfTask
     exit 0
 }
@@ -315,6 +336,7 @@ $timer.add_Tick({
         $timer.Stop()
         $script:allowClose = $true
         Clear-DeferralState
+        Save-CleanupSentinel
         Remove-SelfTask
         # Auto-reboot path: best-effort. If shutdown fails, the sentinel file
         # written inside Invoke-RebootRequest tells the next maintenance pass
@@ -336,6 +358,7 @@ $rebootNowBtn.add_Click({
         $timer.Stop()
         $script:allowClose = $true
         Clear-DeferralState
+        Save-CleanupSentinel
         Remove-SelfTask
         $window.Close()
     } else {
@@ -357,12 +380,13 @@ $scheduleBtn.add_Click({
     # Intentionally NOT calling Remove-SelfTask: if the scheduled shutdown is
     # aborted (e.g. admin runs `shutdown /a`), the task stays registered and
     # re-prompts at the next interval. After a successful reboot, the prompt's
-    # post-launch Test-PendingReboot self-cleans the task.
+    # post-launch Test-PendingReboot self-cleans (via the cleanup sentinel).
     $result = Invoke-RebootRequest -DelaySeconds $delay -Comment "Scheduled reboot at $($when.ToString('h:mm tt'))"
     if ($result.Success) {
         $timer.Stop()
         $script:allowClose = $true
         Clear-DeferralState
+        Save-CleanupSentinel
         $window.Close()
     } else {
         [System.Windows.MessageBox]::Show(
@@ -402,16 +426,13 @@ $window.ShowDialog() | Out-Null
 function Test-PendingReboot {
     # Runs on the endpoint. Without the Invoke-ImmyCommand wrapper, Test-Path
     # would probe the ImmyBot backend's registry instead of the target's.
+    # Only CBS and WU are checked: PendingFileRenameOperations is too noisy in
+    # the wild (Chrome / OneDrive / AV updates routinely set it without the
+    # user actually needing to reboot), so we'd nag people for non-events.
     Invoke-ImmyCommand -Context System -ScriptBlock {
         $cbs = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         $wu  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-        $pfro = $false
-        try {
-            $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
-                -Name PendingFileRenameOperations -ErrorAction Stop
-            if ($sm.PendingFileRenameOperations) { $pfro = $true }
-        } catch { }
-        return ($cbs -or $wu -or $pfro)
+        return ($cbs -or $wu)
     }
 }
 
@@ -575,9 +596,11 @@ function Register-RebootPromptTask {
     Write-Host "Registered scheduled task '$taskName' for $userPrincipal."
 }
 
-# Test escape: tests dot-source this script with $immyRebootMaintenanceTestMode = $true
-# to get the helper functions defined without running the body.
-if ($immyRebootMaintenanceTestMode) { return }
+# Test/dot-source escape: tests dot-source this script (with or without
+# $immyRebootMaintenanceTestMode) to get the helper functions defined
+# without running the body. Dot-source detection is the structural
+# guarantee; the variable is kept for explicit invoke-style overrides.
+if ($MyInvocation.InvocationName -eq '.' -or $immyRebootMaintenanceTestMode) { return }
 
 # -------------------------------------------------------------------------
 # Main flow
@@ -595,6 +618,26 @@ if ($verboseDiagnostics) {
         Write-Host "Could not probe endpoint LanguageMode: $($_.Exception.Message)"
     }
 }
+
+# Reconcile orphaned scheduled tasks. The user-context prompt can't
+# unregister tasks that this script registered as SYSTEM, so it drops a
+# 'cleanup-requested-<username>' sentinel and we do the unregister here.
+# Failures are swallowed: if the task has already been removed manually,
+# the sentinel is still cleared so we don't retry forever.
+Invoke-ImmyCommand -Context System -ScriptBlock {
+    $folder = $using:stagingFolder
+    if (-not (Test-Path $folder)) { return }
+    $sentinels = Get-ChildItem -Path $folder -Filter 'cleanup-requested-*' -File -ErrorAction SilentlyContinue
+    foreach ($sentinel in $sentinels) {
+        $username = $sentinel.Name -replace '^cleanup-requested-', ''
+        $taskName = "$($using:taskNamePrefix)-$username"
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+            Write-Output "Unregistered orphaned task '$taskName'."
+        } catch { }
+        Remove-Item -Path $sentinel.FullName -Force -ErrorAction SilentlyContinue
+    }
+} | ForEach-Object { Write-Host $_ }
 
 # Reboot sentinel: if a prompt's user-context shutdown.exe failed (typically
 # SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
