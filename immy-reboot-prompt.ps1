@@ -66,6 +66,43 @@ function Clear-DeferralState {
     }
 }
 
+# Scheduled-reboot flag: written when the user picks Schedule and shutdown.exe
+# accepts the request. Read on prompt launch so the 4-hour task tick doesn't
+# bug the user again before the queued reboot fires. Lives under ProgramData
+# (machine-scoped) so a schedule by user A also suppresses prompts for user B
+# on the same box.
+function Get-PendingScheduledReboot {
+    param([Parameter(Mandatory)] [string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $content = (Get-Content -Path $Path -Raw).Trim()
+        if (-not $content) { return $null }
+        return [DateTime]::Parse($content, [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $null
+    }
+}
+
+function Save-ScheduledReboot {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [DateTime]$When
+    )
+    $dir = Split-Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $iso = $When.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    Set-Content -Path $Path -Value $iso -Encoding UTF8 -NoNewline
+}
+
+function Clear-ScheduledReboot {
+    param([Parameter(Mandatory)] [string]$Path)
+    if (Test-Path $Path) {
+        Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Remove-SelfTask {
     if (-not $TaskName) { return }
     try {
@@ -144,13 +181,32 @@ if (-not (Test-Path $ConfigPath)) {
 
 $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
+$scheduledFlagPath = if ($config.ScheduledRebootFlagPath) { $config.ScheduledRebootFlagPath } else { 'C:\ProgramData\RebootPrompt\scheduled-reboot.flag' }
+
 # If the reboot was already taken care of (manual restart, etc.), tear down
 # the task and exit. Also reset the per-user defer count for next cycle.
 if (-not (Test-PendingReboot)) {
     Clear-DeferralState
+    Clear-ScheduledReboot -Path $scheduledFlagPath
     Save-CleanupSentinel
     Remove-SelfTask
     exit 0
+}
+
+# Suppress this firing if the user already scheduled a future reboot. Without
+# this, the task's 4-hour repeat keeps re-prompting between Schedule click and
+# the queued shutdown firing (registry pending-reboot flags don't clear until
+# the reboot actually happens, so Test-PendingReboot stays true).
+$pendingScheduled = Get-PendingScheduledReboot -Path $scheduledFlagPath
+if ($pendingScheduled) {
+    if ($pendingScheduled -gt (Get-Date)) {
+        Write-Host "Reboot already scheduled for $($pendingScheduled.ToString('o')); skipping prompt."
+        exit 0
+    }
+    # Stale: scheduled time has passed but the reboot didn't happen
+    # (shutdown /a, shutdown.exe failure, machine asleep, etc.). Clear the
+    # flag and prompt the user again.
+    Clear-ScheduledReboot -Path $scheduledFlagPath
 }
 
 # -------------------------------------------------------------------------
@@ -331,6 +387,7 @@ $scheduleBtn.add_Click({
     # post-launch Test-PendingReboot self-cleans (via the cleanup sentinel).
     $result = Invoke-RebootRequest -DelaySeconds $delay -Comment "Scheduled reboot at $($when.ToString('h:mm tt'))"
     if ($result.Success) {
+        Save-ScheduledReboot -Path $scheduledFlagPath -When $when
         $timer.Stop()
         $script:allowClose = $true
         Clear-DeferralState

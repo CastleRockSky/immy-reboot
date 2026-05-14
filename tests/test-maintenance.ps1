@@ -51,6 +51,8 @@ Assert { $minRebootHour -eq 22 }                           "minRebootHour defaul
 Assert { $promptTitle -eq 'Restart Required' }             "promptTitle default = 'Restart Required'"
 Assert { -not [string]::IsNullOrEmpty($promptMessage) }    "promptMessage default is non-empty"
 Assert { $stagingFolder -eq 'C:\ProgramData\RebootPrompt' } "stagingFolder default applied"
+Assert { $sentinelPath      -eq (Join-Path $stagingFolder 'reboot-requested.flag') } "sentinelPath defaults under stagingFolder"
+Assert { $scheduledFlagPath -eq (Join-Path $stagingFolder 'scheduled-reboot.flag') } "scheduledFlagPath defaults under stagingFolder"
 
 # -------------------------------------------------------------------------
 

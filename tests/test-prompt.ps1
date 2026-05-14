@@ -62,6 +62,38 @@ Assert { $deferStateRegPath -like 'HKCU:*' } "deferStateRegPath is under HKCU"
 
 # -------------------------------------------------------------------------
 
+Section "4. Scheduled-reboot flag lifecycle"
+$tmpFlag = Join-Path $env:TEMP ("ScheduledRebootTest-" + [Guid]::NewGuid().ToString('N') + ".flag")
+try {
+    Assert { $null -eq (Get-PendingScheduledReboot -Path $tmpFlag) } "No flag: returns null"
+
+    $future = (Get-Date).AddHours(8)
+    Save-ScheduledReboot -Path $tmpFlag -When $future
+    Assert { Test-Path $tmpFlag } "After save: flag file exists"
+
+    $back = Get-PendingScheduledReboot -Path $tmpFlag
+    Assert { $back -is [DateTime] }                                "Round-trip returns DateTime"
+    Assert { [Math]::Abs(($back - $future).TotalSeconds) -lt 1 }   "Round-tripped time matches within 1s"
+    Assert { $back -gt (Get-Date) }                                "Round-tripped time is in the future"
+
+    $past = (Get-Date).AddHours(-2)
+    Save-ScheduledReboot -Path $tmpFlag -When $past
+    $back = Get-PendingScheduledReboot -Path $tmpFlag
+    Assert { $back -lt (Get-Date) }                                "Past time is recognized as past (stale-flag path)"
+
+    Clear-ScheduledReboot -Path $tmpFlag
+    Assert { -not (Test-Path $tmpFlag) }                           "After clear: file removed"
+    Assert { $null -eq (Get-PendingScheduledReboot -Path $tmpFlag) } "After clear: returns null"
+
+    "garbage-not-a-date" | Set-Content -Path $tmpFlag -Encoding UTF8 -NoNewline
+    Assert { $null -eq (Get-PendingScheduledReboot -Path $tmpFlag) } "Unparseable contents: returns null (no throw)"
+}
+finally {
+    if (Test-Path $tmpFlag) { Remove-Item $tmpFlag -Force -ErrorAction SilentlyContinue }
+}
+
+# -------------------------------------------------------------------------
+
 Write-Host ""
 Write-Host "Summary: $pass passed, $fail failed" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
 if ($fail -gt 0) { exit 1 }

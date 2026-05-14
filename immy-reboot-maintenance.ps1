@@ -41,10 +41,11 @@ if ($null -eq $brandImageUrl)            { $brandImageUrl = "" }
 if (-not $stagingFolder)                 { $stagingFolder = "C:\ProgramData\RebootPrompt" }
 if ($null -eq $verboseDiagnostics)       { $verboseDiagnostics = $false }
 
-$promptScriptPath = Join-Path $stagingFolder 'immy-reboot-prompt.ps1'
-$configPath       = Join-Path $stagingFolder 'config.json'
-$sentinelPath     = Join-Path $stagingFolder 'reboot-requested.flag'
-$taskNamePrefix   = 'RebootPrompt'
+$promptScriptPath  = Join-Path $stagingFolder 'immy-reboot-prompt.ps1'
+$configPath        = Join-Path $stagingFolder 'config.json'
+$sentinelPath      = Join-Path $stagingFolder 'reboot-requested.flag'
+$scheduledFlagPath = Join-Path $stagingFolder 'scheduled-reboot.flag'
+$taskNamePrefix    = 'RebootPrompt'
 
 # Inlined contents of immy-reboot-prompt.ps1 for single-file ImmyBot deployment.
 # Populated by build.ps1; in the source repo this contains the placeholder
@@ -279,7 +280,8 @@ $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $u
 if ($sentinelExists) {
     Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
     Invoke-ImmyCommand -Context System -ScriptBlock {
-        Remove-Item -Path $using:sentinelPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:sentinelPath      -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:scheduledFlagPath -Force -ErrorAction SilentlyContinue
     }
     Restart-ComputerAndWait
     return
@@ -299,14 +301,15 @@ if ($users.Count -eq 0) {
 }
 
 $config = @{
-    Title                  = $promptTitle
-    Message                = $promptMessage
-    AutoRebootAfterSeconds = [int]$autoRebootAfterSeconds
-    MinRebootHour          = [int]$minRebootHour
-    PostponeIntervalHours  = [int]$postponeIntervalHours
-    MaxDefers              = [int]$maxDefers
-    SentinelPath           = $sentinelPath
-    BrandImageUrl          = $brandImageUrl
+    Title                   = $promptTitle
+    Message                 = $promptMessage
+    AutoRebootAfterSeconds  = [int]$autoRebootAfterSeconds
+    MinRebootHour           = [int]$minRebootHour
+    PostponeIntervalHours   = [int]$postponeIntervalHours
+    MaxDefers               = [int]$maxDefers
+    SentinelPath            = $sentinelPath
+    ScheduledRebootFlagPath = $scheduledFlagPath
+    BrandImageUrl           = $brandImageUrl
 }
 
 Save-PromptStaging -ScriptDestination $promptScriptPath -ConfigDestination $configPath -Config $config
