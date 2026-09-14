@@ -94,6 +94,46 @@ finally {
 
 # -------------------------------------------------------------------------
 
+Section "5. Invoke-RebootRequest: sentinel on shutdown.exe failure (PS 5.1 stderr regression)"
+# Shim shutdown.exe as a function: PowerShell resolves functions before
+# external commands, so '& shutdown.exe' inside Invoke-RebootRequest hits
+# this. The shim calls a real native command that writes to stderr so the
+# test exercises genuine NativeCommandError behaviour - under Windows
+# PowerShell 5.1 with $ErrorActionPreference = 'Stop' that used to throw
+# before the exit code was checked, and the sentinel was never written.
+$tmpSentinel = Join-Path $env:TEMP ("RebootSentinelTest-" + [Guid]::NewGuid().ToString('N') + ".flag")
+$config = @{ SentinelPath = $tmpSentinel }
+try {
+    function shutdown.exe { cmd.exe /c "echo Access is denied.(5) 1>&2 & exit 5" }
+
+    $r = $null
+    $threw = $false
+    try { $r = Invoke-RebootRequest -DelaySeconds 0 } catch { $threw = $true; Write-Host "  (threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
+    Assert { -not $threw }                                          "Failing shutdown.exe does not throw out of Invoke-RebootRequest"
+    Assert { $null -ne $r -and $r.Success -eq $false }              "Returns Success = false"
+    Assert { $r.Output -like '*Access is denied*' }                 "Captures shutdown.exe stderr text in Output"
+    Assert { Test-Path $tmpSentinel }                               "Sentinel file written on failure"
+    Assert { (Get-Content $tmpSentinel -Raw) -like '*exit 5*' }     "Sentinel records the shutdown.exe exit code"
+    Assert { $ErrorActionPreference -eq 'Stop' }                    "Script-level ErrorActionPreference left untouched"
+
+    Remove-Item $tmpSentinel -Force -ErrorAction SilentlyContinue
+    function shutdown.exe { cmd.exe /c "exit 0" }
+    $r = Invoke-RebootRequest -DelaySeconds 0
+    Assert { $r.Success -eq $true }                                 "Successful shutdown.exe returns Success = true"
+    Assert { -not (Test-Path $tmpSentinel) }                        "No sentinel written on success"
+}
+finally {
+    Remove-Item Function:\shutdown.exe -ErrorAction SilentlyContinue
+    if (Test-Path $tmpSentinel) { Remove-Item $tmpSentinel -Force -ErrorAction SilentlyContinue }
+}
+
+# -------------------------------------------------------------------------
+
+Section "6. Staging folder derives from -ConfigPath"
+Assert { $stagingFolder -eq 'C:\' } "stagingFolder = parent of the -ConfigPath passed at dot-source (was '$stagingFolder')"
+
+# -------------------------------------------------------------------------
+
 Write-Host ""
 Write-Host "Summary: $pass passed, $fail failed" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
 if ($fail -gt 0) { exit 1 }

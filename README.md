@@ -120,6 +120,13 @@ invisible in dev. If you're writing your own metascripts, watch for them:
    binary work down there. At the metascript layer, use cmdlets and
    PowerShell operators only.
 
+4. **Windows PowerShell 5.1 turns native stderr into a terminating error
+   under `$ErrorActionPreference = 'Stop'` when you use `2>&1`.** Any
+   endpoint-side script that shells out (`shutdown.exe`, `gpupdate`, etc.)
+   and inspects `$LASTEXITCODE` afterwards never gets there if the tool
+   wrote a single stderr line. Scope the preference to `Continue` around
+   the native call. See `Invoke-RebootRequest` in `immy-reboot-prompt.ps1`.
+
 Set `$verboseDiagnostics = $true` to log the language modes at both layers
 into your ImmyBot session log.
 

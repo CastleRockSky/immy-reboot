@@ -25,6 +25,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Staging folder: every machine-scoped file this script touches (sentinels,
+# flags, transcript) lives alongside config.json. Derived from -ConfigPath so
+# a custom $stagingFolder on the maintenance side is honored here too; the
+# config's StagingFolder key (if present) overrides after config load.
+$stagingFolder = if ($ConfigPath) { Split-Path $ConfigPath -Parent } else { 'C:\ProgramData\RebootPrompt' }
+if (-not $stagingFolder) { $stagingFolder = 'C:\ProgramData\RebootPrompt' }
+
 # -------------------------------------------------------------------------
 
 function Test-PendingReboot {
@@ -116,7 +123,7 @@ function Save-CleanupSentinel {
     # lacks rights to remove it. Drop a breadcrumb here that the next
     # SYSTEM-context maintenance pass picks up to do the actual cleanup.
     # File name carries the username so per-user tasks can be identified.
-    $sentinel = Join-Path 'C:\ProgramData\RebootPrompt' "cleanup-requested-$env:USERNAME"
+    $sentinel = Join-Path $stagingFolder "cleanup-requested-$env:USERNAME"
     try {
         $dir = Split-Path $sentinel -Parent
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -135,21 +142,39 @@ function Invoke-RebootRequest {
     )
     $shutdownArgs = @('/r', '/t', $DelaySeconds)
     if ($Comment) { $shutdownArgs += @('/c', $Comment) }
-    $output = & shutdown.exe @shutdownArgs 2>&1
-    if ($LASTEXITCODE -eq 0) {
+
+    # Windows PowerShell 5.1 gotcha: with $ErrorActionPreference = 'Stop', a
+    # native command that writes to stderr under 2>&1 throws a terminating
+    # error on the first stderr line - before $LASTEXITCODE is ever inspected.
+    # That is exactly the case we exist to handle ("Access is denied.(5)" when
+    # SeShutdownPrivilege is stripped), so relax the preference around the
+    # call. Assignment inside a function is scope-local, but restore anyway
+    # for clarity.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & shutdown.exe @shutdownArgs 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0) {
         return @{ Success = $true; Output = '' }
     }
 
-    $sentinelPath = if ($config.SentinelPath) { $config.SentinelPath } else { 'C:\ProgramData\RebootPrompt\reboot-requested.flag' }
+    # $output holds ErrorRecords (stderr) and/or strings (stdout); stringify both.
+    $outputText = ($output | ForEach-Object { "$_" }) -join [Environment]::NewLine
+
+    $sentinelPath = if ($config.SentinelPath) { $config.SentinelPath } else { Join-Path $stagingFolder 'reboot-requested.flag' }
     try {
         $sentinelDir = Split-Path $sentinelPath -Parent
         if (-not (Test-Path $sentinelDir)) {
             New-Item -ItemType Directory -Path $sentinelDir -Force | Out-Null
         }
         $stamp = (Get-Date).ToUniversalTime().ToString('o')
-        Set-Content -Path $sentinelPath -Value "$stamp $env:USERNAME requested reboot; shutdown.exe exit $LASTEXITCODE" -Encoding UTF8
+        Set-Content -Path $sentinelPath -Value "$stamp $env:USERNAME requested reboot; shutdown.exe exit $exitCode" -Encoding UTF8
     } catch { }
-    return @{ Success = $false; Output = ($output -join [Environment]::NewLine) }
+    return @{ Success = $false; Output = $outputText }
 }
 
 # Test/dot-source escape. Sits before any side effects (transcript, param
@@ -167,7 +192,7 @@ if (-not $ConfigPath -or -not $TaskName) {
 # Cheap diagnostics: leave a transcript on disk so a silent failure isn't
 # guesswork. Per-user filename to avoid clobbering on multi-user hosts.
 try {
-    Start-Transcript -Path "C:\ProgramData\RebootPrompt\last-run-$env:USERNAME.log" -Force -ErrorAction SilentlyContinue | Out-Null
+    Start-Transcript -Path (Join-Path $stagingFolder "last-run-$env:USERNAME.log") -Force -ErrorAction SilentlyContinue | Out-Null
 } catch { }
 
 # -------------------------------------------------------------------------
@@ -181,7 +206,9 @@ if (-not (Test-Path $ConfigPath)) {
 
 $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
-$scheduledFlagPath = if ($config.ScheduledRebootFlagPath) { $config.ScheduledRebootFlagPath } else { 'C:\ProgramData\RebootPrompt\scheduled-reboot.flag' }
+if ($config.StagingFolder) { $stagingFolder = [string]$config.StagingFolder }
+
+$scheduledFlagPath = if ($config.ScheduledRebootFlagPath) { $config.ScheduledRebootFlagPath } else { Join-Path $stagingFolder 'scheduled-reboot.flag' }
 
 # If the reboot was already taken care of (manual restart, etc.), tear down
 # the task and exit. Also reset the per-user defer count for next cycle.

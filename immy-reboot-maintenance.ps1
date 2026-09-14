@@ -307,6 +307,7 @@ $config = @{
     MinRebootHour           = [int]$minRebootHour
     PostponeIntervalHours   = [int]$postponeIntervalHours
     MaxDefers               = [int]$maxDefers
+    StagingFolder           = $stagingFolder
     SentinelPath            = $sentinelPath
     ScheduledRebootFlagPath = $scheduledFlagPath
     BrandImageUrl           = $brandImageUrl
