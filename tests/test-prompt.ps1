@@ -209,3 +209,6 @@ finally {
 Write-Host ""
 Write-Host "Summary: $pass passed, $fail failed" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
 if ($fail -gt 0) { exit 1 }
+# Explicit success exit: CI's 'shell: powershell' wrapper otherwise exits with
+# $LASTEXITCODE, which a mocked shutdown.exe failure above can leave non-zero.
+exit 0
