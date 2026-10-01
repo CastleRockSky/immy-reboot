@@ -44,11 +44,14 @@ function Section { param([string]$T) Write-Host ""; Write-Host "=== $T ===" -For
 # -------------------------------------------------------------------------
 
 Section "1. Defaults applied when no Metascript Variables are set"
-Assert { $postponeIntervalHours -eq 4 }                    "postponeIntervalHours default = 4"
+Assert { $postponeIntervalHours -eq 24 }                   "postponeIntervalHours default = 24"
 Assert { $maxDefers -eq 3 }                                "maxDefers default = 3"
 Assert { $autoRebootAfterSeconds -eq 600 }                 "autoRebootAfterSeconds default = 600"
 Assert { $minRebootHour -eq 22 }                           "minRebootHour default = 22"
-Assert { $promptTitle -eq 'Restart Required' }             "promptTitle default = 'Restart Required'"
+Assert { $maxAutoReboots -eq 2 }                           "maxAutoReboots default = 2"
+Assert { $rebootLoopWindowHours -eq 24 }                   "rebootLoopWindowHours default = 24"
+Assert { $brandImageUrl -like 'https://*' }                "brandImageUrl default is an https URL"
+Assert { $promptTitle -eq 'Castle Rock Sky Reboot Notifier' } "promptTitle default = 'Castle Rock Sky Reboot Notifier'"
 Assert { -not [string]::IsNullOrEmpty($promptMessage) }    "promptMessage default is non-empty"
 Assert { $stagingFolder -eq 'C:\ProgramData\RebootPrompt' } "stagingFolder default applied"
 Assert { $sentinelPath      -eq (Join-Path $stagingFolder 'reboot-requested.flag') } "sentinelPath defaults under stagingFolder"

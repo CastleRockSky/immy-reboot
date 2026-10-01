@@ -67,13 +67,15 @@ new dist into ImmyBot.
 
 | Variable                  | Default                            | Purpose                                               |
 | ------------------------- | ---------------------------------- | ----------------------------------------------------- |
-| `$postponeIntervalHours`  | `4`                                | Hours between re-prompts via the scheduled task.      |
+| `$postponeIntervalHours`  | `24`                               | Hours between re-prompts via the scheduled task.      |
 | `$maxDefers`              | `3`                                | Postpone clicks before the button is hidden. `0` disables Postpone entirely. |
 | `$autoRebootAfterSeconds` | `600` (10 min)                     | Countdown shown in the prompt before auto-reboot.     |
 | `$minRebootHour`          | `22` (10 PM)                       | Earliest hour shown in the schedule dropdown.         |
-| `$promptTitle`            | `"Restart Required"`               | Window title.                                         |
-| `$promptMessage`          | _(generic update message)_         | Body text shown to the user.                          |
-| `$brandImageUrl`          | `""`                               | Optional logo URL shown above the message. Must be reachable from the endpoint; empty disables the image. |
+| `$promptTitle`            | `"Castle Rock Sky Reboot Notifier"`| Window title.                                         |
+| `$promptMessage`          | _(Castle Rock Sky update message)_ | Body text shown to the user.                          |
+| `$maxAutoReboots`         | `2`                                | Automatic (countdown) reboots allowed for one unresolved pending-reboot episode before the prompt stops forcing reboots. `0` disables the guard. |
+| `$rebootLoopWindowHours`  | `24`                               | Hours after the last automatic reboot before the loop guard re-arms. |
+| `$brandImageUrl`          | Castle Rock Sky logo URL           | Optional logo URL shown above the message. Must be reachable from the endpoint; set to `""` to disable the image. |
 | `$stagingFolder`          | `"C:\ProgramData\RebootPrompt"`    | Where the prompt script and config are staged.        |
 | `$verboseDiagnostics`     | `$false`                           | Log language modes and extra detail to the maintenance session log. |
 

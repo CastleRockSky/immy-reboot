@@ -104,7 +104,7 @@ function Clear-DeferralState {
 }
 
 # Scheduled-reboot flag: written when the user picks Schedule and shutdown.exe
-# accepts the request. Read on prompt launch so the 4-hour task tick doesn't
+# accepts the request. Read on prompt launch so the task's repeat tick doesn't
 # bug the user again before the queued reboot fires. Lives under ProgramData
 # (machine-scoped) so a schedule by user A also suppresses prompts for user B
 # on the same box.
@@ -538,7 +538,7 @@ if (-not (Test-ActionablePendingReboot -Signals $signals)) {
 }
 
 # Suppress this firing if the user already scheduled a future reboot. Without
-# this, the task's 4-hour repeat keeps re-prompting between Schedule click and
+# this, the task's repeat interval keeps re-prompting between Schedule click and
 # the queued shutdown firing (registry pending-reboot flags don't clear until
 # the reboot actually happens, so Test-PendingReboot stays true).
 $bootUtc = $null
