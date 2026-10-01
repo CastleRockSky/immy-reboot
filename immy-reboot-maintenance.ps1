@@ -43,7 +43,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.4'
+$scriptVersion = '1.1.5'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -648,8 +648,33 @@ if ($scheduledWhen) {
     # Also reached via [DateTime]::MinValue when the flag was beyond the
     # trust horizon - forged/corrupt flags get cleared like stale ones.
     Write-Host "Scheduled reboot flag is stale ($($scheduledWhen.ToString('o'))); clearing and continuing."
-    Invoke-ImmyCommand -Context System -ScriptBlock {
+    # shutdown /t counts down machine-awake time, so a schedule that came due
+    # while the machine slept leaves its countdown queued, paused partway; it
+    # then fires at an arbitrary later time and blocks any new schedule with
+    # exit 1190 (Nick, 1.1.4). If the machine hasn't booted since the scheduled
+    # time, that reboot never happened - abort the leftover countdown. Skipped
+    # for MinValue (forged/corrupt flag): there's no real schedule behind it.
+    # The flag is re-read on the endpoint rather than passed via $using: so
+    # the time comparison stays in the endpoint's local time zone.
+    $abortResult = Invoke-ImmyCommand -Context System -ScriptBlock {
+        $result = $null
+        try {
+            $raw = (Get-Content -Path $using:scheduledFlagPath -Raw -ErrorAction Stop).Trim()
+            $when = [DateTime]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
+            $boot = $null
+            try { $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+            if ($when -le (Get-Date).AddHours(48) -and (-not $boot -or $boot -lt $when)) {
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try { & shutdown.exe /a 2>&1 | Out-Null } finally { $ErrorActionPreference = $prevEap }
+                $result = "last boot $(if ($boot) { $boot.ToString('o') } else { 'unknown' }); shutdown /a exit $LASTEXITCODE (0 = aborted a queued countdown, 1116 = none queued)"
+            }
+        } catch { }
         Remove-Item -Path $using:scheduledFlagPath -Force -ErrorAction SilentlyContinue
+        $result
+    }
+    if ($abortResult) {
+        Write-Host "Scheduled reboot never happened; $abortResult."
     }
 }
 

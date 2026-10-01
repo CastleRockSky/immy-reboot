@@ -43,7 +43,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.4'
+$scriptVersion = '1.1.5'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -406,6 +406,55 @@ function Remove-SelfTask {
     } catch { }
 }
 
+# shutdown.exe exit code for "A system shutdown has already been scheduled."
+# A queued /t countdown blocks every new /r request until it fires or is
+# aborted with /a.
+$ShutdownAlreadyScheduledCode = 1190
+
+function Invoke-ShutdownExe {
+    # Runs shutdown.exe with the given arguments and returns
+    # @{ ExitCode = int; Output = string }. Never throws on a non-zero exit.
+    #
+    # Windows PowerShell 5.1 gotcha: with $ErrorActionPreference = 'Stop', a
+    # native command that writes to stderr under 2>&1 throws a terminating
+    # error on the first stderr line - before $LASTEXITCODE is ever inspected.
+    # That is exactly the case callers exist to handle ("Access is denied.(5)"
+    # when SeShutdownPrivilege is stripped, 1190 when a shutdown is already
+    # queued), so relax the preference around the call. Assignment inside a
+    # function is scope-local, but restore anyway for clarity.
+    param([Parameter(Mandatory)] [string[]]$Arguments)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & shutdown.exe @Arguments 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $exitCode = $LASTEXITCODE
+    # $output holds ErrorRecords (stderr) and/or strings (stdout); stringify both.
+    $outputText = ($output | ForEach-Object { "$_" }) -join [Environment]::NewLine
+    return @{ ExitCode = $exitCode; Output = $outputText }
+}
+
+function Test-StaleScheduleNeedsAbort {
+    # Decides whether a stale scheduled-reboot flag (its time has passed but a
+    # reboot is still pending) may have left our shutdown.exe countdown queued.
+    # shutdown /t counts down machine-awake time, not wall-clock time: a laptop
+    # asleep at the scheduled hour wakes with the countdown paused partway, and
+    # it then fires at an arbitrary later time (Nick, 1.1.4). If the machine
+    # hasn't booted since the scheduled time, that reboot never happened, so the
+    # countdown may still be queued and must be aborted before re-prompting.
+    # An unknown boot time errs toward aborting - a stray /a is harmless (exit
+    # 1116, nothing to abort), whereas a surprise reboot is not. Pure: the boot
+    # time is passed in so it can be unit-tested.
+    param(
+        [Parameter(Mandatory)] [DateTime]$ScheduledFor,
+        $BootTimeUtc
+    )
+    if (-not $BootTimeUtc) { return $true }
+    return ([DateTime]$BootTimeUtc) -lt $ScheduledFor.ToUniversalTime()
+}
+
 function Invoke-RebootRequest {
     # Tries shutdown.exe in the user's context.
     #
@@ -437,22 +486,21 @@ function Invoke-RebootRequest {
     $shutdownArgs = @('/r', '/t', $DelaySeconds)
     if ($Comment) { $shutdownArgs += @('/c', $Comment) }
 
-    # Windows PowerShell 5.1 gotcha: with $ErrorActionPreference = 'Stop', a
-    # native command that writes to stderr under 2>&1 throws a terminating
-    # error on the first stderr line - before $LASTEXITCODE is ever inspected.
-    # That is exactly the case we exist to handle ("Access is denied.(5)" when
-    # SeShutdownPrivilege is stripped), so relax the preference around the
-    # call. Assignment inside a function is scope-local, but restore anyway
-    # for clarity.
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $output = & shutdown.exe @shutdownArgs 2>&1
-    } finally {
-        $ErrorActionPreference = $prevEap
+    $r = Invoke-ShutdownExe -Arguments $shutdownArgs
+    # 1190: a shutdown countdown is already queued - typically an earlier
+    # Schedule whose countdown stalled while the machine slept. The user is
+    # explicitly choosing a new time (or now), so replace the old request
+    # rather than failing every attempt with what looks like a scheduling
+    # conflict. Retry once only.
+    if ($r.ExitCode -eq $ShutdownAlreadyScheduledCode) {
+        Write-Host "shutdown.exe reports a shutdown is already scheduled (exit $($r.ExitCode)); aborting it and retrying."
+        $abort = Invoke-ShutdownExe -Arguments @('/a')
+        Write-Host "shutdown /a exit $($abort.ExitCode)."
+        $r = Invoke-ShutdownExe -Arguments $shutdownArgs
     }
-    $exitCode = $LASTEXITCODE
+    $exitCode = $r.ExitCode
     if ($exitCode -eq 0) {
+        Write-Host "Reboot requested: shutdown /r /t $DelaySeconds accepted."
         # Only mark immediate-reboot requests. A scheduled (delayed) reboot
         # hasn't happened yet, so recording it as a reboot request would
         # falsify the breadcrumb for the hours until it fires.
@@ -466,8 +514,8 @@ function Invoke-RebootRequest {
         return @{ Success = $true; Output = '' }
     }
 
-    # $output holds ErrorRecords (stderr) and/or strings (stdout); stringify both.
-    $outputText = ($output | ForEach-Object { "$_" }) -join [Environment]::NewLine
+    $outputText = $r.Output
+    Write-Host "Reboot request failed: shutdown /r /t $DelaySeconds exit $exitCode. $outputText"
 
     if ($WriteSentinelOnFailure) {
         $effectiveSentinel = if ($SentinelPath) { $SentinelPath } `
@@ -585,6 +633,9 @@ if (-not (Test-ActionablePendingReboot -Signals $signals)) {
 # this, the task's 4-hour repeat keeps re-prompting between Schedule click and
 # the queued shutdown firing (registry pending-reboot flags don't clear until
 # the reboot actually happens, so Test-PendingReboot stays true).
+$bootUtc = $null
+try { $bootUtc = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { }
+
 $pendingScheduled = Get-PendingScheduledReboot -Path $scheduledFlagPath
 if ($pendingScheduled) {
     if ($pendingScheduled -gt (Get-Date)) {
@@ -592,8 +643,14 @@ if ($pendingScheduled) {
         exit 0
     }
     # Stale: scheduled time has passed but the reboot didn't happen
-    # (shutdown /a, shutdown.exe failure, machine asleep, etc.). Clear the
-    # flag and prompt the user again.
+    # (shutdown /a, shutdown.exe failure, machine asleep, etc.). If the machine
+    # hasn't booted since then, our countdown may still be queued (it pauses
+    # during sleep) and would fire at a random time later - abort it. Then
+    # clear the flag and prompt the user again.
+    if (Test-StaleScheduleNeedsAbort -ScheduledFor $pendingScheduled -BootTimeUtc $bootUtc) {
+        $abort = Invoke-ShutdownExe -Arguments @('/a')
+        Write-Host "Scheduled reboot for $($pendingScheduled.ToString('o')) never happened (last boot $(if ($bootUtc) { $bootUtc.ToString('o') } else { 'unknown' })); shutdown /a exit $($abort.ExitCode) (0 = aborted a queued countdown, 1116 = none queued)."
+    }
     Clear-ScheduledReboot -Path $scheduledFlagPath
 }
 
@@ -604,8 +661,6 @@ if ($pendingScheduled) {
 # reboots is worse than one unresolved update. Suppress the fire entirely (no
 # window, no nag); the ledger file is left in place for an admin to spot via
 # logs.ps1, and a fresh maintenance pass / the loop window lapsing re-arms it.
-$bootUtc = $null
-try { $bootUtc = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { }
 if (Test-RebootLoopGuard -Path $rebootLedgerPath -PendingNow $signals.Any -BootTimeUtc $bootUtc `
         -MaxAutoReboots $maxAutoReboots -WindowHours $rebootLoopWindowHours -NowUtc (Get-Date).ToUniversalTime()) {
     $ledger = Get-RebootLedger -Path $rebootLedgerPath
@@ -729,6 +784,7 @@ $timer.add_Tick({
     if ($script:secondsLeft -le 0) {
         $timer.Stop()
         $script:allowClose = $true
+        Write-Host "Auto-reboot countdown expired; requesting immediate reboot."
         Clear-DeferralState
         Remove-SelfTask
         # Auto-reboot path: best-effort. If shutdown fails, the sentinel file
@@ -758,6 +814,7 @@ $rebootNowBtn.add_Click({
         $window, "Reboot this computer now?", $config.Title,
         'YesNo', 'Question')
     if ($confirm -ne 'Yes') { $timer.Start(); return }
+    Write-Host "User chose Reboot Now."
     $result = Invoke-RebootRequest -DelaySeconds 0 `
         -WriteSentinelOnFailure `
         -SentinelPath $sentinelPath `
@@ -788,6 +845,7 @@ $scheduleBtn.add_Click({
         $window, "Schedule reboot for $($when.ToString('h:mm tt'))?", $config.Title,
         'YesNo', 'Question')
     if ($confirm -ne 'Yes') { $timer.Start(); return }
+    Write-Host "User chose Schedule for $($when.ToString('o'))."
 
     $delay = [int]([Math]::Max(60, ($when - (Get-Date)).TotalSeconds))
     # Intentionally NOT calling Remove-SelfTask: if the scheduled shutdown is
@@ -819,6 +877,7 @@ $postponeBtn.add_Click({
     $timer.Stop()
     $script:allowClose = $true
     Save-DeferralIncrement
+    Write-Host "User chose Postpone (now $((Get-DeferralState).DeferCount) of $maxDefers)."
     $window.Close()
 })
 
@@ -1395,8 +1454,33 @@ if ($scheduledWhen) {
     # Also reached via [DateTime]::MinValue when the flag was beyond the
     # trust horizon - forged/corrupt flags get cleared like stale ones.
     Write-Host "Scheduled reboot flag is stale ($($scheduledWhen.ToString('o'))); clearing and continuing."
-    Invoke-ImmyCommand -Context System -ScriptBlock {
+    # shutdown /t counts down machine-awake time, so a schedule that came due
+    # while the machine slept leaves its countdown queued, paused partway; it
+    # then fires at an arbitrary later time and blocks any new schedule with
+    # exit 1190 (Nick, 1.1.4). If the machine hasn't booted since the scheduled
+    # time, that reboot never happened - abort the leftover countdown. Skipped
+    # for MinValue (forged/corrupt flag): there's no real schedule behind it.
+    # The flag is re-read on the endpoint rather than passed via $using: so
+    # the time comparison stays in the endpoint's local time zone.
+    $abortResult = Invoke-ImmyCommand -Context System -ScriptBlock {
+        $result = $null
+        try {
+            $raw = (Get-Content -Path $using:scheduledFlagPath -Raw -ErrorAction Stop).Trim()
+            $when = [DateTime]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
+            $boot = $null
+            try { $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+            if ($when -le (Get-Date).AddHours(48) -and (-not $boot -or $boot -lt $when)) {
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try { & shutdown.exe /a 2>&1 | Out-Null } finally { $ErrorActionPreference = $prevEap }
+                $result = "last boot $(if ($boot) { $boot.ToString('o') } else { 'unknown' }); shutdown /a exit $LASTEXITCODE (0 = aborted a queued countdown, 1116 = none queued)"
+            }
+        } catch { }
         Remove-Item -Path $using:scheduledFlagPath -Force -ErrorAction SilentlyContinue
+        $result
+    }
+    if ($abortResult) {
+        Write-Host "Scheduled reboot never happened; $abortResult."
     }
 }
 
