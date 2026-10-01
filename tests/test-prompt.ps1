@@ -108,7 +108,13 @@ try {
 
     $r = $null
     $threw = $false
+    # Sentinel is opt-in: Schedule failures must not escalate to a SYSTEM reboot.
     try { $r = Invoke-RebootRequest -DelaySeconds 0 } catch { $threw = $true; Write-Host "  (threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
+    Assert { -not $threw }                                          "Failing shutdown.exe does not throw without -WriteSentinelOnFailure"
+    Assert { -not (Test-Path $tmpSentinel) }                        "No sentinel written without -WriteSentinelOnFailure"
+
+    $r = $null
+    try { $r = Invoke-RebootRequest -DelaySeconds 0 -WriteSentinelOnFailure } catch { $threw = $true; Write-Host "  (threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
     Assert { -not $threw }                                          "Failing shutdown.exe does not throw out of Invoke-RebootRequest"
     Assert { $null -ne $r -and $r.Success -eq $false }              "Returns Success = false"
     Assert { $r.Output -like '*Access is denied*' }                 "Captures shutdown.exe stderr text in Output"

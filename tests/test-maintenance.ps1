@@ -84,11 +84,14 @@ try {
     }
     $scriptDest = Join-Path $tmp 'immy-reboot-prompt.ps1'
     $configDest = Join-Path $tmp 'config.json'
+    $launcherDest = Join-Path $tmp 'immy-reboot-prompt-launcher.vbs'
 
-    Save-PromptStaging -ScriptDestination $scriptDest -ConfigDestination $configDest -Config $cfg
+    Save-PromptStaging -ScriptDestination $scriptDest -ConfigDestination $configDest `
+        -LauncherDestination $launcherDest -LauncherSource $launcherScript -Config $cfg
 
     Assert { Test-Path $scriptDest }                                       "Prompt script staged"
     Assert { Test-Path $configDest }                                       "Config file staged"
+    Assert { Test-Path $launcherDest }                                     "VBS launcher staged"
     Assert { (Get-Item $scriptDest).Length -gt 0 }                         "Staged prompt is non-zero bytes"
     Assert { (Get-Item $configDest).Length -gt 0 }                         "Staged config is non-zero bytes"
 
