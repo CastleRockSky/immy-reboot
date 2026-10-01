@@ -108,7 +108,13 @@ try {
 
     $r = $null
     $threw = $false
+    # Sentinel is opt-in: Schedule failures must not escalate to a SYSTEM reboot.
     try { $r = Invoke-RebootRequest -DelaySeconds 0 } catch { $threw = $true; Write-Host "  (threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
+    Assert { -not $threw }                                          "Failing shutdown.exe does not throw without -WriteSentinelOnFailure"
+    Assert { -not (Test-Path $tmpSentinel) }                        "No sentinel written without -WriteSentinelOnFailure"
+
+    $r = $null
+    try { $r = Invoke-RebootRequest -DelaySeconds 0 -WriteSentinelOnFailure } catch { $threw = $true; Write-Host "  (threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
     Assert { -not $threw }                                          "Failing shutdown.exe does not throw out of Invoke-RebootRequest"
     Assert { $null -ne $r -and $r.Success -eq $false }              "Returns Success = false"
     Assert { $r.Output -like '*Access is denied*' }                 "Captures shutdown.exe stderr text in Output"
@@ -134,6 +140,75 @@ Assert { $stagingFolder -eq 'C:\' } "stagingFolder = parent of the -ConfigPath p
 
 # -------------------------------------------------------------------------
 
+Section "7. Invoke-RebootRequest replaces an already-queued shutdown (exit 1190)"
+# Nick's 1.1.4 report: a Schedule countdown stalled while the laptop slept,
+# so every new Schedule failed with 1190 ("already scheduled"). The shim
+# records each call and returns 1190 for /r until /a has been called.
+$tmpSentinel = Join-Path $env:TEMP ("RebootSentinelTest-" + [Guid]::NewGuid().ToString('N') + ".flag")
+$config = @{ SentinelPath = $tmpSentinel }
+try {
+    $script:shutdownCalls = @()
+    $script:queued = $true
+    function shutdown.exe {
+        $script:shutdownCalls += ($args -join ' ')
+        if ($args[0] -eq '/a') { $script:queued = $false; cmd.exe /c "exit 0"; return }
+        if ($script:queued) { cmd.exe /c "echo A system shutdown has already been scheduled.(1190) 1>&2 & exit 1190"; return }
+        cmd.exe /c "exit 0"
+    }
+    $r = Invoke-RebootRequest -DelaySeconds 3600 -Comment 'test'
+    Assert { $r.Success -eq $true }                                  "Succeeds after aborting the queued shutdown"
+    Assert { $script:shutdownCalls.Count -eq 3 }                     "Calls shutdown.exe three times: /r, /a, /r (was $($script:shutdownCalls.Count))"
+    Assert { $script:shutdownCalls[1] -eq '/a' }                     "Second call is /a"
+    Assert { $script:shutdownCalls[2] -like '/r /t 3600*' }          "Retry re-sends the original /r request"
+
+    # Abort doesn't clear it (e.g. no rights): retry once only, then fail.
+    $script:shutdownCalls = @()
+    function shutdown.exe {
+        $script:shutdownCalls += ($args -join ' ')
+        if ($args[0] -eq '/a') { cmd.exe /c "exit 5"; return }
+        cmd.exe /c "echo A system shutdown has already been scheduled.(1190) 1>&2 & exit 1190"
+    }
+    $r = Invoke-RebootRequest -DelaySeconds 0 -WriteSentinelOnFailure
+    Assert { $r.Success -eq $false }                                 "Persistent 1190 returns Success = false"
+    Assert { $script:shutdownCalls.Count -eq 3 }                     "Retries exactly once (was $($script:shutdownCalls.Count) calls)"
+    Assert { (Get-Content $tmpSentinel -Raw) -like '*exit 1190*' }  "Sentinel records exit 1190 when retry also fails"
+
+    # Other failures don't trigger an abort.
+    $script:shutdownCalls = @()
+    function shutdown.exe { $script:shutdownCalls += ($args -join ' '); cmd.exe /c "exit 5" }
+    $r = Invoke-RebootRequest -DelaySeconds 0
+    Assert { $script:shutdownCalls.Count -eq 1 }                     "Non-1190 failure does not call /a or retry"
+}
+finally {
+    Remove-Item Function:\shutdown.exe -ErrorAction SilentlyContinue
+    if (Test-Path $tmpSentinel) { Remove-Item $tmpSentinel -Force -ErrorAction SilentlyContinue }
+}
+
+# -------------------------------------------------------------------------
+
+Section "8. Test-StaleScheduleNeedsAbort"
+$when = Get-Date -Date (Get-Date).AddDays(-1) -Hour 22 -Minute 0 -Second 0
+Assert { Test-StaleScheduleNeedsAbort -ScheduledFor $when -BootTimeUtc $when.AddDays(-3).ToUniversalTime() } "Booted before the scheduled time (slept through it): abort"
+Assert { -not (Test-StaleScheduleNeedsAbort -ScheduledFor $when -BootTimeUtc $when.AddMinutes(2).ToUniversalTime()) } "Booted after the scheduled time (reboot happened): don't abort"
+Assert { Test-StaleScheduleNeedsAbort -ScheduledFor $when -BootTimeUtc $null } "Unknown boot time: abort (stray /a is harmless)"
+
+# Flag round-trip: the parsed flag is local time, boot time is UTC.
+$tmpFlag = Join-Path $env:TEMP ("ScheduledRebootTest-" + [Guid]::NewGuid().ToString('N') + ".flag")
+try {
+    Save-ScheduledReboot -Path $tmpFlag -When $when
+    $back = Get-PendingScheduledReboot -Path $tmpFlag
+    Assert { Test-StaleScheduleNeedsAbort -ScheduledFor $back -BootTimeUtc $when.AddMinutes(-1).ToUniversalTime() } "Round-tripped flag vs UTC boot 1 min earlier: abort"
+    Assert { -not (Test-StaleScheduleNeedsAbort -ScheduledFor $back -BootTimeUtc $when.AddMinutes(1).ToUniversalTime()) } "Round-tripped flag vs UTC boot 1 min later: don't abort"
+}
+finally {
+    if (Test-Path $tmpFlag) { Remove-Item $tmpFlag -Force -ErrorAction SilentlyContinue }
+}
+
+# -------------------------------------------------------------------------
+
 Write-Host ""
 Write-Host "Summary: $pass passed, $fail failed" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
 if ($fail -gt 0) { exit 1 }
+# Explicit success exit: CI's 'shell: powershell' wrapper otherwise exits with
+# $LASTEXITCODE, which a mocked shutdown.exe failure above can leave non-zero.
+exit 0
