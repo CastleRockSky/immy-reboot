@@ -311,7 +311,12 @@ function Remove-SelfTask {
     if (-not $TaskName) { return }
     try {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-    } catch { }
+        Write-Host "Removed scheduled task '$TaskName'."
+    } catch {
+        # Expected for tasks registered before 1.1.6 (no delete grant); the
+        # next maintenance pass sweeps them.
+        Write-Host "Could not remove scheduled task '$TaskName': $($_.Exception.Message)"
+    }
 }
 
 # shutdown.exe exit code for "A system shutdown has already been scheduled."

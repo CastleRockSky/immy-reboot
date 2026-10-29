@@ -24,6 +24,9 @@ ImmyBot maintenance window
   immy-reboot-maintenance.ps1   (runs on the ImmyBot backend, returns in seconds)
         |
         |  -- Test-PendingReboot via Invoke-ImmyCommand on the endpoint
+        |  -- if nothing actionable yet: register the same task with a
+        |     delayed first fire (recheck), so patches installed later in
+        |     the session still get prompted, exit
         |  -- if no users logged in: Restart-ComputerAndWait, exit
         |  -- otherwise: stage script + config under C:\ProgramData\RebootPrompt
         |     and register a per-user scheduled task on the endpoint
@@ -75,6 +78,7 @@ new dist into ImmyBot.
 | `$promptMessage`          | _(Castle Rock Sky update message)_ | Body text shown to the user.                          |
 | `$maxAutoReboots`         | `2`                                | Automatic (countdown) reboots allowed for one unresolved pending-reboot episode before the prompt stops forcing reboots. `0` disables the guard. |
 | `$rebootLoopWindowHours`  | `24`                               | Hours after the last automatic reboot before the loop guard re-arms. |
+| `$recheckDelayMinutes`    | `90`                               | When no reboot is pending yet, minutes until the prompt task re-checks (catches patches the same session installs after this task ran). The task removes itself if nothing turned up. `0` disables. |
 | `$brandImageUrl`          | Castle Rock Sky logo URL           | Optional logo URL shown above the message. Must be reachable from the endpoint; set to `""` to disable the image. |
 | `$stagingFolder`          | `"C:\ProgramData\RebootPrompt"`    | Where the prompt script and config are staged.        |
 | `$verboseDiagnostics`     | `$false`                           | Log language modes and extra detail to the maintenance session log. |
