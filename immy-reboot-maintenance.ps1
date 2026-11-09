@@ -4,7 +4,10 @@
 # ImmyBot metascript. Runs as SYSTEM at the end of a maintenance session.
 #
 # Flow:
-#   1. If no pending reboot: exit silently.
+#   1. If no actionable pending reboot: if users are logged in, register the
+#      prompt task with a delayed first fire (a "recheck") so a reboot flag
+#      set by patching later in the same session still gets prompted; the
+#      prompt tears itself down if nothing turned up. Otherwise exit.
 #   2. If no interactive users: reboot immediately via Restart-ComputerAndWait.
 #   3. Otherwise: stage immy-reboot-prompt.ps1 + a config file under
 #      C:\ProgramData\RebootPrompt and register a per-user scheduled task
@@ -32,6 +35,10 @@
 #                               reachable from the endpoint. Defaults to the
 #                               Castle Rock Sky logo; set to '' to disable
 #                               the image entirely.
+#   $recheckDelayMinutes      - when no reboot is pending yet, minutes until
+#                               the prompt task re-checks (default 90; 0
+#                               disables). Covers patches the same session
+#                               installs after this task has run.
 #   $stagingFolder            - where prompt + config are staged
 #                               (default C:\ProgramData\RebootPrompt)
 #   $verboseDiagnostics       - log language modes + extra detail to the
@@ -43,7 +50,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.5'
+$scriptVersion = '1.1.7'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -51,6 +58,7 @@ if ($null -eq $autoRebootAfterSeconds)   { $autoRebootAfterSeconds = 600 }
 if ($null -eq $maxAutoReboots)           { $maxAutoReboots = 2 }
 if ($null -eq $rebootLoopWindowHours)    { $rebootLoopWindowHours = 24 }
 if ($null -eq $minRebootHour)            { $minRebootHour = 22 }
+if ($null -eq $recheckDelayMinutes)      { $recheckDelayMinutes = 90 }
 if (-not $promptTitle)                   { $promptTitle = "Castle Rock Sky Reboot Notifier" }
 if (-not $promptMessage)                 { $promptMessage = "Castle Rock Sky has installed updates and your computer needs to restart. Please save your work and choose an option below." }
 if ($null -eq $brandImageUrl)            { $brandImageUrl = "https://castlerocksky.com/img/castlerocksky-horizontal.jpg" }
@@ -298,7 +306,8 @@ function Register-RebootPromptTask {
     param(
         [Parameter(Mandatory)] $User,
         [Parameter(Mandatory)] [string]$LauncherPath,
-        [Parameter(Mandatory)] [int]$IntervalHours
+        [Parameter(Mandatory)] [int]$IntervalHours,
+        [int]$StartDelayMinutes = 5
     )
 
     $taskName      = "$taskNamePrefix-$($User.Username)"
@@ -309,19 +318,22 @@ function Register-RebootPromptTask {
     # every task fire. The VBS takes the task name as its only argument
     # and locates the prompt + config relative to its own folder.
     $argList = '"{0}" "{1}"' -f $LauncherPath, $taskName
+    $userSid = $User.SID
 
     Invoke-ImmyCommand -Context System -ScriptBlock {
         $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $using:argList
 
         $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $using:userPrincipal
 
-        # Repeat every N hours starting five minutes from now. The five-minute
-        # delay gives ImmyBot time to finish post-maintenance log uploads etc.
-        # before the prompt window appears in the user's session. Duration is
-        # set to ~10 years (effectively indefinite); the prompt script removes
-        # the task once Test-PendingReboot returns false.
+        # Repeat every N hours starting StartDelayMinutes from now. The default
+        # five-minute delay gives ImmyBot time to finish post-maintenance log
+        # uploads etc. before the prompt window appears in the user's session;
+        # a recheck registration passes a longer delay so the session's
+        # patching has finished first. Duration is set to ~10 years
+        # (effectively indefinite); the prompt script removes the task once
+        # no actionable reboot is pending.
         $repeatTrigger = New-ScheduledTaskTrigger `
-            -Once -At (Get-Date).AddMinutes(5) `
+            -Once -At (Get-Date).AddMinutes($using:StartDelayMinutes) `
             -RepetitionInterval (New-TimeSpan -Hours $using:IntervalHours) `
             -RepetitionDuration (New-TimeSpan -Days 3650)
 
@@ -342,9 +354,59 @@ function Register-RebootPromptTask {
             -Principal $principal `
             -Settings $settings `
             -Force | Out-Null
-    }
+        $name = $using:taskName
+        $who  = $using:userPrincipal
+        Write-Output "Registered scheduled task '$name' for $who."
 
-    Write-Host "Registered scheduled task '$taskName' for $userPrincipal."
+        # A SYSTEM-registered task only grants its principal read access, so
+        # the prompt's Remove-SelfTask (running as that user) gets "Access is
+        # denied" and the task lingers until a later maintenance pass sweeps
+        # it. Add a DELETE-only ACE for the user: enough to unregister the
+        # task, not to modify it. Failure is non-fatal - the sweep in
+        # Remove-StaleRebootPromptTask remains the fallback.
+        try {
+            $sid = $using:userSid
+            if (-not $sid) {
+                $acct = New-Object System.Security.Principal.NTAccount($who)
+                $sid  = $acct.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+            $svc = New-Object -ComObject Schedule.Service
+            $svc.Connect()
+            $task = $svc.GetFolder('\').GetTask($name)
+            $sddl = $task.GetSecurityDescriptor(4)   # 4 = DACL_SECURITY_INFORMATION
+            $task.SetSecurityDescriptor("$sddl(A;;SD;;;$sid)", 0)
+            Write-Output "Granted $who delete rights on '$name'."
+        } catch {
+            Write-Output "Could not grant delete rights on '$name' (maintenance will clean it up instead): $($_.Exception.Message)"
+        }
+    } | ForEach-Object { Write-Host $_ }
+}
+
+function Install-RebootPromptForUsers {
+    # Stages the prompt + config and registers a prompt task for each user.
+    # Shared by the pending-reboot path (first fire in 5 minutes) and the
+    # recheck path (first fire after the session's patching has finished).
+    param(
+        [Parameter(Mandatory)] [object[]]$Users,
+        [Parameter(Mandatory)] [hashtable]$Config,
+        [int]$StartDelayMinutes = 5
+    )
+
+    Save-PromptStaging `
+        -ScriptDestination   $promptScriptPath `
+        -ConfigDestination   $configPath `
+        -LauncherDestination $launcherScriptPath `
+        -LauncherSource      $launcherScript `
+        -Config              $Config
+
+    foreach ($u in $Users) {
+        try {
+            Register-RebootPromptTask -User $u -LauncherPath $launcherScriptPath `
+                -IntervalHours $postponeIntervalHours -StartDelayMinutes $StartDelayMinutes
+        } catch {
+            Write-Warning "Failed to register reboot prompt for $($u.Domain)\$($u.Username): $($_.Exception.Message)"
+        }
+    }
 }
 
 function Select-RebootPromptTaskName {
@@ -366,14 +428,14 @@ function Select-RebootPromptTaskName {
 }
 
 function Remove-StaleRebootPromptTask {
-    # Removes leftover RebootPrompt-* scheduled tasks. This is the loose end the
-    # prompt itself can't tie off: the metascript registers each task as SYSTEM
-    # but it runs as the interactive user, who lacks delete rights, so the
-    # prompt's user-context Remove-SelfTask hits "Access is denied" and the task
-    # lingers - firing indefinitely after the reboot it nagged about is long
-    # resolved. Maintenance runs as SYSTEM, so it CAN delete them. Called from
-    # the no-pending-reboot branch, where any surviving task is by definition
-    # stale.
+    # Removes leftover RebootPrompt-* scheduled tasks. Since 1.1.6
+    # Register-RebootPromptTask grants the user delete rights so the prompt's
+    # Remove-SelfTask can tear its own task down; this sweep is the fallback
+    # for tasks registered before then, or where that grant failed (the
+    # prompt then hits "Access is denied" and the task keeps firing after the
+    # reboot it nagged about is long resolved). Maintenance runs as SYSTEM, so
+    # it can always delete them. Called from the no-pending-reboot branch,
+    # where any surviving task is by definition stale.
     #
     # Two-step (enumerate, then remove) so the metascript-level, unit-tested
     # Select-RebootPromptTaskName does the matching rather than a raw wildcard
@@ -578,15 +640,36 @@ if ($verboseDiagnostics) {
     }
 }
 
+$config = @{
+    Version                 = $scriptVersion
+    Title                   = $promptTitle
+    Message                 = $promptMessage
+    AutoRebootAfterSeconds  = [int]$autoRebootAfterSeconds
+    MinRebootHour           = [int]$minRebootHour
+    PostponeIntervalHours   = [int]$postponeIntervalHours
+    MaxDefers               = [int]$maxDefers
+    StagingFolder           = $stagingFolder
+    SentinelPath            = $sentinelPath
+    ScheduledRebootFlagPath = $scheduledFlagPath
+    PostRebootMarkerPath    = $postRebootMarkerPath
+    RebootLedgerPath        = $rebootLedgerPath
+    MaxAutoReboots          = [int]$maxAutoReboots
+    RebootLoopWindowHours   = [int]$rebootLoopWindowHours
+    BrandImageUrl           = $brandImageUrl
+}
+
 $signals = Get-PendingRebootSignals
 
 # Reboot sentinel: if a prompt's user-context shutdown.exe failed (typically
 # SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
 # Only honor it while a reboot is actually still pending: a sentinel that
 # survived the reboot that resolved the episode (transient shutdown.exe
-# failure, manual restart) must not reboot a healthy machine.
+# failure, manual restart) must not reboot a healthy machine. "Pending"
+# means CBS/WU, not PFRO: PFRO is routinely present after a reboot, so
+# gating on $signals.Any would force a second, pointless reboot. A sentinel
+# that fails this gate is cleared in the non-actionable branch below.
 $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $using:sentinelPath }
-if ($sentinelExists -and $signals.Any) {
+if ($sentinelExists -and (Test-ActionablePendingReboot -Signals $signals)) {
     Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
     Invoke-ImmyCommand -Context System -ScriptBlock {
         Remove-Item -Path $using:sentinelPath         -Force -ErrorAction SilentlyContinue
@@ -618,6 +701,21 @@ if (-not (Test-ActionablePendingReboot -Signals $signals)) {
     # SYSTEM-registered task), so with the reboot now resolved this SYSTEM pass
     # is what actually retires them.
     Remove-StaleRebootPromptTask -Prefix $taskNamePrefix
+
+    # This task can run before the session's own patching finishes: on
+    # 2026-10-27 it ran at 7:06 PM and a .NET update set WU RebootRequired at
+    # 7:08 PM, so the reboot went unprompted until the next weekly pass.
+    # Register the normal prompt task with a delayed first fire. If a CBS/WU
+    # signal has appeared by then, the prompt runs the episode as usual;
+    # otherwise its actionability gate tears the task down without showing
+    # anything (the 1.1.6 delete grant lets it remove itself).
+    if ($recheckDelayMinutes -gt 0) {
+        $users = @(Get-LoggedInUser)
+        if ($users.Count -gt 0) {
+            Install-RebootPromptForUsers -Users $users -Config $config -StartDelayMinutes $recheckDelayMinutes
+            Write-Host "Recheck registered for $($users.Count) user(s) in $recheckDelayMinutes minute(s), in case later patching requires a reboot."
+        }
+    }
     return
 }
 
@@ -708,42 +806,11 @@ Invoke-ImmyCommand -Context System -ScriptBlock {
     Remove-Item -Path $using:postRebootMarkerPath -Force -ErrorAction SilentlyContinue
 }
 
-$config = @{
-    Version                 = $scriptVersion
-    Title                   = $promptTitle
-    Message                 = $promptMessage
-    AutoRebootAfterSeconds  = [int]$autoRebootAfterSeconds
-    MinRebootHour           = [int]$minRebootHour
-    PostponeIntervalHours   = [int]$postponeIntervalHours
-    MaxDefers               = [int]$maxDefers
-    StagingFolder           = $stagingFolder
-    SentinelPath            = $sentinelPath
-    ScheduledRebootFlagPath = $scheduledFlagPath
-    PostRebootMarkerPath    = $postRebootMarkerPath
-    RebootLedgerPath        = $rebootLedgerPath
-    MaxAutoReboots          = [int]$maxAutoReboots
-    RebootLoopWindowHours   = [int]$rebootLoopWindowHours
-    BrandImageUrl           = $brandImageUrl
-}
-
 if (-not (Test-RebootDeferralPolicy)) {
     Write-Warning "This endpoint has NO Windows reboot-deferral policy (NoAutoRebootWithLoggedOnUsers / active hours). Windows may auto-restart on its own schedule regardless of this prompt. See README 'Prerequisite: Windows must defer reboots'."
 }
 
-Save-PromptStaging `
-    -ScriptDestination   $promptScriptPath `
-    -ConfigDestination   $configPath `
-    -LauncherDestination $launcherScriptPath `
-    -LauncherSource      $launcherScript `
-    -Config              $config
-
-foreach ($u in $users) {
-    try {
-        Register-RebootPromptTask -User $u -LauncherPath $launcherScriptPath -IntervalHours $postponeIntervalHours
-    } catch {
-        Write-Warning "Failed to register reboot prompt for $($u.Domain)\$($u.Username): $($_.Exception.Message)"
-    }
-}
+Install-RebootPromptForUsers -Users $users -Config $config
 
 Write-Host "Pending reboot detected. Prompt task registered for $($users.Count) user(s)."
 

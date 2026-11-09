@@ -50,6 +50,7 @@ Assert { $autoRebootAfterSeconds -eq 600 }                 "autoRebootAfterSecon
 Assert { $minRebootHour -eq 22 }                           "minRebootHour default = 22"
 Assert { $maxAutoReboots -eq 2 }                           "maxAutoReboots default = 2"
 Assert { $rebootLoopWindowHours -eq 24 }                   "rebootLoopWindowHours default = 24"
+Assert { $recheckDelayMinutes -eq 90 }                     "recheckDelayMinutes default = 90"
 Assert { $brandImageUrl -like 'https://*' }                "brandImageUrl default is an https URL"
 Assert { $promptTitle -eq 'Castle Rock Sky Reboot Notifier' } "promptTitle default = 'Castle Rock Sky Reboot Notifier'"
 Assert { -not [string]::IsNullOrEmpty($promptMessage) }    "promptMessage default is non-empty"

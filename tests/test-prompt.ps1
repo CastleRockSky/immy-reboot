@@ -178,6 +178,18 @@ try {
     function shutdown.exe { $script:shutdownCalls += ($args -join ' '); cmd.exe /c "exit 5" }
     $r = Invoke-RebootRequest -DelaySeconds 0
     Assert { $script:shutdownCalls.Count -eq 1 }                     "Non-1190 failure does not call /a or retry"
+
+    # 1271: locked session refuses /t 0 without /f; retry once with /f.
+    $script:shutdownCalls = @()
+    function shutdown.exe {
+        $script:shutdownCalls += ($args -join ' ')
+        if ($args -contains '/f') { cmd.exe /c "exit 0"; return }
+        cmd.exe /c "echo The machine is locked and cannot be shut down without the force option.(1271) 1>&2 & exit 1271"
+    }
+    $r = Invoke-RebootRequest -DelaySeconds 0
+    Assert { $r.Success -eq $true }                                  "Locked machine (1271) succeeds on /f retry"
+    Assert { $script:shutdownCalls.Count -eq 2 }                     "Calls shutdown.exe twice for 1271 (was $($script:shutdownCalls.Count))"
+    Assert { $script:shutdownCalls[1] -like '/r /t 0*/f' }           "Retry adds /f to the original request"
 }
 finally {
     Remove-Item Function:\shutdown.exe -ErrorAction SilentlyContinue
