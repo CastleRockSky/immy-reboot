@@ -50,7 +50,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.6'
+$scriptVersion = '1.1.7'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -664,9 +664,12 @@ $signals = Get-PendingRebootSignals
 # SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
 # Only honor it while a reboot is actually still pending: a sentinel that
 # survived the reboot that resolved the episode (transient shutdown.exe
-# failure, manual restart) must not reboot a healthy machine.
+# failure, manual restart) must not reboot a healthy machine. "Pending"
+# means CBS/WU, not PFRO: PFRO is routinely present after a reboot, so
+# gating on $signals.Any would force a second, pointless reboot. A sentinel
+# that fails this gate is cleared in the non-actionable branch below.
 $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $using:sentinelPath }
-if ($sentinelExists -and $signals.Any) {
+if ($sentinelExists -and (Test-ActionablePendingReboot -Signals $signals)) {
     Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
     Invoke-ImmyCommand -Context System -ScriptBlock {
         Remove-Item -Path $using:sentinelPath         -Force -ErrorAction SilentlyContinue

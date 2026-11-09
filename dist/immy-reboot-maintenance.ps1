@@ -50,7 +50,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.6'
+$scriptVersion = '1.1.7'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -424,6 +424,11 @@ function Remove-SelfTask {
 # aborted with /a.
 $ShutdownAlreadyScheduledCode = 1190
 
+# shutdown.exe exit code for "The machine is locked and cannot be shut down
+# without the force option." Only an immediate (/t 0) request hits this: any
+# /t greater than 0 implies /f.
+$ShutdownMachineLockedCode = 1271
+
 function Invoke-ShutdownExe {
     # Runs shutdown.exe with the given arguments and returns
     # @{ ExitCode = int; Output = string }. Never throws on a non-zero exit.
@@ -509,6 +514,15 @@ function Invoke-RebootRequest {
         Write-Host "shutdown.exe reports a shutdown is already scheduled (exit $($r.ExitCode)); aborting it and retrying."
         $abort = Invoke-ShutdownExe -Arguments @('/a')
         Write-Host "shutdown /a exit $($abort.ExitCode)."
+        $r = Invoke-ShutdownExe -Arguments $shutdownArgs
+    }
+    # 1271: the session is locked. The auto-countdown typically expires on a
+    # locked screen (the prompt fired while the user was away), and without
+    # /f the reboot is refused (2026-11-03, D-TOBEFILLEDBYO). The countdown
+    # was the user's warning, so force it. Retry once only.
+    if ($r.ExitCode -eq $ShutdownMachineLockedCode) {
+        Write-Host "shutdown.exe reports the machine is locked (exit $($r.ExitCode)); retrying with /f."
+        $shutdownArgs += '/f'
         $r = Invoke-ShutdownExe -Arguments $shutdownArgs
     }
     $exitCode = $r.ExitCode
@@ -798,19 +812,26 @@ $timer.add_Tick({
         $timer.Stop()
         $script:allowClose = $true
         Write-Host "Auto-reboot countdown expired; requesting immediate reboot."
-        Clear-DeferralState
-        Remove-SelfTask
         # Auto-reboot path: best-effort. If shutdown fails, the sentinel file
         # written inside Invoke-RebootRequest tells the next maintenance pass
         # to reboot as SYSTEM. Either way, close the window. This is the
         # unattended path, so it counts toward the reboot-loop guard.
-        Invoke-RebootRequest -DelaySeconds 0 `
+        $result = Invoke-RebootRequest -DelaySeconds 0 `
             -WriteSentinelOnFailure `
             -SentinelPath $sentinelPath `
             -PostRebootMarkerPath $postRebootMarkerPath `
             -CountTowardLoopGuard `
             -RebootLedgerPath $rebootLedgerPath `
-            -LoopWindowHours $rebootLoopWindowHours | Out-Null
+            -LoopWindowHours $rebootLoopWindowHours
+        # Only retire the task once the reboot is actually under way, as Reboot
+        # Now does. On failure it stays registered and re-prompts at the next
+        # interval / logon instead of going silent until the next maintenance
+        # pass (once 1.1.6's delete grant made Remove-SelfTask succeed, an
+        # early removal left the user unprompted for a week).
+        if ($result.Success) {
+            Clear-DeferralState
+            Remove-SelfTask
+        }
         $window.Close()
     } else {
         $countdownText.Text = Format-Countdown $script:secondsLeft
@@ -1475,9 +1496,12 @@ $signals = Get-PendingRebootSignals
 # SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
 # Only honor it while a reboot is actually still pending: a sentinel that
 # survived the reboot that resolved the episode (transient shutdown.exe
-# failure, manual restart) must not reboot a healthy machine.
+# failure, manual restart) must not reboot a healthy machine. "Pending"
+# means CBS/WU, not PFRO: PFRO is routinely present after a reboot, so
+# gating on $signals.Any would force a second, pointless reboot. A sentinel
+# that fails this gate is cleared in the non-actionable branch below.
 $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $using:sentinelPath }
-if ($sentinelExists -and $signals.Any) {
+if ($sentinelExists -and (Test-ActionablePendingReboot -Signals $signals)) {
     Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
     Invoke-ImmyCommand -Context System -ScriptBlock {
         Remove-Item -Path $using:sentinelPath         -Force -ErrorAction SilentlyContinue
