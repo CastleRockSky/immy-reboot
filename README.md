@@ -10,8 +10,8 @@ fills that gap with a two-part script that:
 - enforces a deferral cap so users can't postpone forever,
 - auto-reboots if no one responds within a configurable countdown,
 - decouples the re-prompt cadence from ImmyBot's weekly maintenance window,
-- and falls back to a SYSTEM-context reboot on the next maintenance pass if
-  GPO has stripped `SeShutdownPrivilege` from interactive users.
+- and reboots machines with nobody signed in directly, even when the session's
+  reboot preference is Suppress.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ ImmyBot maintenance window
         |  -- if nothing actionable yet: register the same task with a
         |     delayed first fire (recheck), so patches installed later in
         |     the session still get prompted, exit
-        |  -- if no users logged in: Restart-ComputerAndWait, exit
+        |  -- if no users logged in: shutdown /r /f /t 60 as SYSTEM, exit
         |  -- otherwise: stage script + config under C:\ProgramData\RebootPrompt
         |     and register a per-user scheduled task on the endpoint
         v
@@ -41,13 +41,17 @@ ImmyBot maintenance window
         |       Schedule Reboot  -> shutdown /r /t <seconds>
         |       Reboot Now       -> shutdown /r /t 0
         |       Postpone         -> close window, count toward cap (HKCU)
-        |       Countdown expiry -> shutdown /r /t 0
+        |       Countdown expiry -> shutdown /r /t 0 (retried with /f if locked)
 ```
 
-If `shutdown.exe` fails in user context (typically because GPO stripped
-`SeShutdownPrivilege`), the prompt drops a sentinel file at
-`C:\ProgramData\RebootPrompt\reboot-requested.flag`. The next ImmyBot
-maintenance pass sees that flag and reboots as SYSTEM.
+If an immediate `shutdown.exe` fails in user context (for example GPO
+stripped `SeShutdownPrivilege`), the prompt keeps its task so the user is
+reminded again, and drops a sentinel file at
+`C:\ProgramData\RebootPrompt\reboot-requested.flag`. The next maintenance pass
+clears that flag and re-runs the episode: signed-in users are prompted again
+(they keep Schedule / Postpone), and a machine with nobody signed in is
+rebooted. The maintenance pass never uses `Restart-ComputerAndWait`, because
+that cmdlet does nothing when the session's reboot preference is Suppress.
 
 ## Deployment
 

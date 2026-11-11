@@ -380,11 +380,12 @@ function Invoke-RebootRequest {
     # recording when we last asked for a reboot (diagnostic breadcrumb; see
     # the marker functions above - it no longer gates prompting).
     #
-    # On failure with -WriteSentinelOnFailure, drops a sentinel file so the
-    # next maintenance pass reboots as SYSTEM instead. That fallback is only
-    # appropriate for "Reboot Now" / auto-countdown; a Schedule failure
-    # shouldn't escalate to "reboot at next maintenance pass" because the
-    # user's intent was specifically a future time.
+    # On failure with -WriteSentinelOnFailure, drops a sentinel file recording
+    # the failed request. Since 1.1.8 the maintenance pass doesn't force a
+    # reboot on it (that took the user's choice away, and Suppress sessions
+    # skipped it anyway): it clears the sentinel and re-runs the episode, so
+    # the user is prompted again. Only "Reboot Now" / auto-countdown pass it;
+    # a failed Schedule is just reported in the window.
     #
     # Returns @{ Success = bool; Output = string }.
     # CountTowardLoopGuard tags this as an AUTOMATIC, unattended reboot (the
@@ -712,10 +713,10 @@ $timer.add_Tick({
         $timer.Stop()
         $script:allowClose = $true
         Write-Host "Auto-reboot countdown expired; requesting immediate reboot."
-        # Auto-reboot path: best-effort. If shutdown fails, the sentinel file
-        # written inside Invoke-RebootRequest tells the next maintenance pass
-        # to reboot as SYSTEM. Either way, close the window. This is the
-        # unattended path, so it counts toward the reboot-loop guard.
+        # Auto-reboot path: best-effort. If shutdown fails, the task stays
+        # registered (below) and re-prompts at the next interval / logon.
+        # Either way, close the window. This is the unattended path, so it
+        # counts toward the reboot-loop guard.
         $result = Invoke-RebootRequest -DelaySeconds 0 `
             -WriteSentinelOnFailure `
             -SentinelPath $sentinelPath `
@@ -761,7 +762,7 @@ $rebootNowBtn.add_Click({
     } else {
         [System.Windows.MessageBox]::Show(
             $window,
-            "Could not start the reboot:`n$($result.Output)`n`nThe request has been logged and will be carried out by the next maintenance pass.",
+            "Could not start the reboot:`n$($result.Output)`n`nPlease restart from the Start menu when you can. Otherwise you'll be reminded again later.",
             $config.Title, 'OK', 'Warning') | Out-Null
         $timer.Start()
     }

@@ -8,7 +8,8 @@
 #      prompt task with a delayed first fire (a "recheck") so a reboot flag
 #      set by patching later in the same session still gets prompted; the
 #      prompt tears itself down if nothing turned up. Otherwise exit.
-#   2. If no interactive users: reboot immediately via Restart-ComputerAndWait.
+#   2. If no interactive users: reboot via shutdown.exe on the endpoint
+#      (not Restart-ComputerAndWait, which a Suppress session skips).
 #   3. Otherwise: stage immy-reboot-prompt.ps1 + a config file under
 #      C:\ProgramData\RebootPrompt and register a per-user scheduled task
 #      that runs the prompt at logon and every N hours until the user
@@ -50,7 +51,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.7'
+$scriptVersion = '1.1.8'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -530,6 +531,38 @@ function Invoke-UnattendedRebootLedgerCheck {
     }
 }
 
+function Invoke-EndpointReboot {
+    # Reboots the endpoint with shutdown.exe as SYSTEM. Deliberately NOT
+    # Restart-ComputerAndWait: that honors the session's reboot preference
+    # and is a silent no-op ("Skipping Restart") under Suppress, which is
+    # exactly the kind of session this task exists to cover. The short delay
+    # lets ImmyBot collect this script's output before the machine goes down.
+    # /f because nobody is logged in to save anything, and a locked/
+    # disconnected session would otherwise refuse with 1271. A queued
+    # countdown (1190) is aborted and replaced once, as the prompt does.
+    param([int]$DelaySeconds = 60)
+    Invoke-ImmyCommand -Context System -ScriptBlock {
+        $delay = [int]$using:DelaySeconds
+        $shutdownArgs = @('/r', '/f', '/t', $delay, '/c', 'Restarting to finish installing updates.')
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & shutdown.exe @shutdownArgs 2>&1
+            $code = $LASTEXITCODE
+            if ($code -eq 1190) {
+                & shutdown.exe /a 2>&1 | Out-Null
+                $out = & shutdown.exe @shutdownArgs 2>&1
+                $code = $LASTEXITCODE
+            }
+        } finally { $ErrorActionPreference = $prevEap }
+        if ($code -eq 0) {
+            Write-Output "Reboot requested: shutdown /r /f /t $delay accepted."
+        } else {
+            Write-Output "Reboot request FAILED: shutdown.exe exit $code. $(($out | ForEach-Object { "$_" }) -join ' ')"
+        }
+    }
+}
+
 function Test-RebootDeferralPolicy {
     # Prerequisite probe: is Windows itself told to defer update reboots?
     # (README 'Prerequisite: Windows must defer reboots'.) Without a policy,
@@ -660,24 +693,24 @@ $config = @{
 
 $signals = Get-PendingRebootSignals
 
-# Reboot sentinel: if a prompt's user-context shutdown.exe failed (typically
-# SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
-# Only honor it while a reboot is actually still pending: a sentinel that
-# survived the reboot that resolved the episode (transient shutdown.exe
-# failure, manual restart) must not reboot a healthy machine. "Pending"
-# means CBS/WU, not PFRO: PFRO is routinely present after a reboot, so
-# gating on $signals.Any would force a second, pointless reboot. A sentinel
-# that fails this gate is cleared in the non-actionable branch below.
+# Reboot sentinel: a prompt's user-context shutdown.exe failed (locked
+# session, SeShutdownPrivilege stripped by GPO, ...) and dropped this flag.
+# Before 1.1.8 this pass then force-rebooted via Restart-ComputerAndWait,
+# which (a) takes the user's Schedule/Postpone choice away and (b) is a
+# no-op under a Suppress session reboot preference - on 2026-11-10 it
+# logged "Skipping Restart" after deleting the sentinel, so the reboot was
+# silently dropped. Now the sentinel only resets the episode: clear it (and
+# any scheduled-reboot flag from the failed attempt) and fall through, so
+# logged-in users get the prompt again and an unattended machine reboots
+# via the no-user path below. A sentinel with no CBS/WU pending is cleared
+# in the non-actionable branch.
 $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $using:sentinelPath }
 if ($sentinelExists -and (Test-ActionablePendingReboot -Signals $signals)) {
-    Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
+    Write-Host "Reboot sentinel found at $sentinelPath - a requested reboot failed. Clearing it and re-running the episode."
     Invoke-ImmyCommand -Context System -ScriptBlock {
-        Remove-Item -Path $using:sentinelPath         -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $using:scheduledFlagPath    -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $using:postRebootMarkerPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:sentinelPath      -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:scheduledFlagPath -Force -ErrorAction SilentlyContinue
     }
-    Restart-ComputerAndWait
-    return
 }
 
 if (-not (Test-ActionablePendingReboot -Signals $signals)) {
@@ -795,7 +828,7 @@ if ($users.Count -eq 0) {
         return
     }
     Write-Host "Pending reboot detected (CBS/WU) and no interactive users. Forced reboot $($decision.Count) of $maxAutoReboots. Rebooting now."
-    Restart-ComputerAndWait
+    Invoke-EndpointReboot | ForEach-Object { Write-Host $_ }
     return
 }
 
