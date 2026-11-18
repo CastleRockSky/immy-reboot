@@ -22,7 +22,9 @@
 #   $postponeIntervalHours    - hours between re-prompts (default 24)
 #   $maxDefers                - max Postpone clicks before button is hidden
 #                               (default 3, 0 disables Postpone)
-#   $autoRebootAfterSeconds   - countdown in UI before auto-reboot (default 600)
+#   $autoRebootAfterSeconds   - countdown in UI before auto-reboot (default
+#                               600). Holds while the session is locked and
+#                               restarts from the top on unlock.
 #   $maxAutoReboots           - cap on consecutive AUTOMATIC reboots forced for a
 #                               pending state a reboot won't clear (default 2;
 #                               0 disables the loop guard). Explicit user
@@ -51,7 +53,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.8'
+$scriptVersion = '1.1.9'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
