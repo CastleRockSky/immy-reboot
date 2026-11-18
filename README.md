@@ -8,10 +8,12 @@ fills that gap with a two-part script that:
 - detects when a reboot is pending after maintenance,
 - prompts each logged-in user with a WPF dialog (Schedule / Reboot Now / Postpone),
 - enforces a deferral cap so users can't postpone forever,
-- auto-reboots if no one responds within a configurable countdown,
+- auto-reboots if no one responds within a configurable countdown, which only
+  runs while the session is unlocked so nobody is rebooted by a warning they
+  couldn't see,
 - decouples the re-prompt cadence from ImmyBot's weekly maintenance window,
-- and falls back to a SYSTEM-context reboot on the next maintenance pass if
-  GPO has stripped `SeShutdownPrivilege` from interactive users.
+- and reboots machines with nobody signed in directly, even when the session's
+  reboot preference is Suppress.
 
 ## Architecture
 
@@ -27,7 +29,7 @@ ImmyBot maintenance window
         |  -- if nothing actionable yet: register the same task with a
         |     delayed first fire (recheck), so patches installed later in
         |     the session still get prompted, exit
-        |  -- if no users logged in: Restart-ComputerAndWait, exit
+        |  -- if no users logged in: shutdown /r /f /t 60 as SYSTEM, exit
         |  -- otherwise: stage script + config under C:\ProgramData\RebootPrompt
         |     and register a per-user scheduled task on the endpoint
         v
@@ -41,13 +43,24 @@ ImmyBot maintenance window
         |       Schedule Reboot  -> shutdown /r /t <seconds>
         |       Reboot Now       -> shutdown /r /t 0
         |       Postpone         -> close window, count toward cap (HKCU)
-        |       Countdown expiry -> shutdown /r /t 0
+        |       Countdown expiry -> shutdown /r /t 0 (never forced on a lock)
 ```
 
-If `shutdown.exe` fails in user context (typically because GPO stripped
-`SeShutdownPrivilege`), the prompt drops a sentinel file at
-`C:\ProgramData\RebootPrompt\reboot-requested.flag`. The next ImmyBot
-maintenance pass sees that flag and reboots as SYSTEM.
+The countdown holds while the session is locked or disconnected and restarts
+from the top on unlock, so a prompt that opens on a locked screen waits for the
+user instead of rebooting under them. Only an explicit Reboot Now is retried
+with `/f` if `shutdown.exe` reports the machine locked. A machine left locked
+with a user signed in therefore stays pending until that user is back; the
+unattended reboot applies only when nobody is signed in.
+
+If an immediate `shutdown.exe` fails in user context (for example GPO
+stripped `SeShutdownPrivilege`), the prompt keeps its task so the user is
+reminded again, and drops a sentinel file at
+`C:\ProgramData\RebootPrompt\reboot-requested.flag`. The next maintenance pass
+clears that flag and re-runs the episode: signed-in users are prompted again
+(they keep Schedule / Postpone), and a machine with nobody signed in is
+rebooted. The maintenance pass never uses `Restart-ComputerAndWait`, because
+that cmdlet does nothing when the session's reboot preference is Suppress.
 
 ## Deployment
 
@@ -72,7 +85,7 @@ new dist into ImmyBot.
 | ------------------------- | ---------------------------------- | ----------------------------------------------------- |
 | `$postponeIntervalHours`  | `24`                               | Hours between re-prompts via the scheduled task.      |
 | `$maxDefers`              | `3`                                | Postpone clicks before the button is hidden. `0` disables Postpone entirely. |
-| `$autoRebootAfterSeconds` | `600` (10 min)                     | Countdown shown in the prompt before auto-reboot.     |
+| `$autoRebootAfterSeconds` | `600` (10 min)                     | Countdown shown in the prompt before auto-reboot. Holds while the session is locked; restarts in full on unlock. |
 | `$minRebootHour`          | `22` (10 PM)                       | Earliest hour shown in the schedule dropdown.         |
 | `$promptTitle`            | `"Castle Rock Sky Reboot Notifier"`| Window title.                                         |
 | `$promptMessage`          | _(Castle Rock Sky update message)_ | Body text shown to the user.                          |

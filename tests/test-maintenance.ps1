@@ -118,6 +118,42 @@ finally {
 
 # -------------------------------------------------------------------------
 
+Section "5. Invoke-EndpointReboot uses shutdown.exe, not Restart-ComputerAndWait"
+# Restart-ComputerAndWait is a no-op under a Suppress session reboot
+# preference (2026-11-10, "Skipping Restart"). Shim shutdown.exe as a function
+# (resolved before the real exe) and record the calls.
+try {
+    $script:shutdownCalls = @()
+    function shutdown.exe { $script:shutdownCalls += ($args -join ' '); cmd.exe /c "exit 0" }
+    $out = @(Invoke-EndpointReboot -DelaySeconds 60)
+    Assert { $script:shutdownCalls.Count -eq 1 }                     "Calls shutdown.exe once on success (was $($script:shutdownCalls.Count))"
+    Assert { $script:shutdownCalls[0] -like '/r /f /t 60*' }         "Requests a forced reboot with the given delay"
+    Assert { ($out -join ' ') -like '*accepted*' }                   "Reports the request as accepted"
+
+    # A queued countdown (1190) is aborted and replaced once.
+    $script:shutdownCalls = @()
+    $script:queued = $true
+    function shutdown.exe {
+        $script:shutdownCalls += ($args -join ' ')
+        if ($args[0] -eq '/a') { $script:queued = $false; cmd.exe /c "exit 0"; return }
+        if ($script:queued) { cmd.exe /c "echo A system shutdown has already been scheduled.(1190) 1>&2 & exit 1190"; return }
+        cmd.exe /c "exit 0"
+    }
+    $out = @(Invoke-EndpointReboot -DelaySeconds 60)
+    Assert { $script:shutdownCalls.Count -eq 3 }                     "1190: calls /r, /a, /r (was $($script:shutdownCalls.Count))"
+    Assert { ($out -join ' ') -like '*accepted*' }                   "1190: succeeds after replacing the queued countdown"
+
+    # A hard failure is reported, not thrown.
+    function shutdown.exe { cmd.exe /c "echo Access is denied.(5) 1>&2 & exit 5" }
+    $out = @(Invoke-EndpointReboot -DelaySeconds 60)
+    Assert { ($out -join ' ') -like '*FAILED*exit 5*' }              "Failure is reported with the exit code"
+}
+finally {
+    Remove-Item Function:\shutdown.exe -ErrorAction SilentlyContinue
+}
+
+# -------------------------------------------------------------------------
+
 Write-Host ""
 Write-Host "Summary: $pass passed, $fail failed" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
 if ($fail -gt 0) { exit 1 }

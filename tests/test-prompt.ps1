@@ -179,17 +179,35 @@ try {
     $r = Invoke-RebootRequest -DelaySeconds 0
     Assert { $script:shutdownCalls.Count -eq 1 }                     "Non-1190 failure does not call /a or retry"
 
-    # 1271: locked session refuses /t 0 without /f; retry once with /f.
+    # 1271: locked session refuses /t 0 without /f. An explicit user action
+    # (-ForceIfLocked) retries once with /f.
     $script:shutdownCalls = @()
     function shutdown.exe {
         $script:shutdownCalls += ($args -join ' ')
         if ($args -contains '/f') { cmd.exe /c "exit 0"; return }
         cmd.exe /c "echo The machine is locked and cannot be shut down without the force option.(1271) 1>&2 & exit 1271"
     }
-    $r = Invoke-RebootRequest -DelaySeconds 0
-    Assert { $r.Success -eq $true }                                  "Locked machine (1271) succeeds on /f retry"
+    $r = Invoke-RebootRequest -DelaySeconds 0 -ForceIfLocked
+    Assert { $r.Success -eq $true }                                  "Locked machine (1271) succeeds on /f retry with -ForceIfLocked"
+    Assert { $r.Locked -eq $false }                                  "Forced success is not reported as Locked"
     Assert { $script:shutdownCalls.Count -eq 2 }                     "Calls shutdown.exe twice for 1271 (was $($script:shutdownCalls.Count))"
     Assert { $script:shutdownCalls[1] -like '/r /t 0*/f' }           "Retry adds /f to the original request"
+
+    # Without -ForceIfLocked (the auto-countdown): never force a locked
+    # session. Reported as Locked, not as a failure - so no sentinel either.
+    Remove-Item $tmpSentinel -Force -ErrorAction SilentlyContinue
+    $script:shutdownCalls = @()
+    $r = Invoke-RebootRequest -DelaySeconds 0 -WriteSentinelOnFailure
+    Assert { $r.Success -eq $false }                                 "Locked machine (1271) without -ForceIfLocked: Success = false"
+    Assert { $r.Locked -eq $true }                                   "Locked machine (1271) without -ForceIfLocked: Locked = true"
+    Assert { $script:shutdownCalls.Count -eq 1 }                     "No retry without -ForceIfLocked (was $($script:shutdownCalls.Count) calls)"
+    Assert { @($script:shutdownCalls | Where-Object { $_ -like '*/f*' }).Count -eq 0 } "/f is never sent without -ForceIfLocked"
+    Assert { -not (Test-Path $tmpSentinel) }                         "A locked refusal writes no sentinel"
+
+    # Other outcomes report Locked = false.
+    function shutdown.exe { cmd.exe /c "exit 5" }
+    $r = Invoke-RebootRequest -DelaySeconds 0
+    Assert { $r.Success -eq $false -and $r.Locked -eq $false }       "Non-1271 failure is not reported as Locked"
 }
 finally {
     Remove-Item Function:\shutdown.exe -ErrorAction SilentlyContinue
@@ -214,6 +232,75 @@ try {
 }
 finally {
     if (Test-Path $tmpFlag) { Remove-Item $tmpFlag -Force -ErrorAction SilentlyContinue }
+}
+
+# -------------------------------------------------------------------------
+
+Section "9. Get-CountdownStep: the countdown holds while the session is locked"
+$s = Get-CountdownStep -SecondsLeft 600 -FullSeconds 600 -Locked $false
+Assert { $s.SecondsLeft -eq 599 -and -not $s.Held -and -not $s.Expired } "Unlocked: one second elapses"
+
+$s = Get-CountdownStep -SecondsLeft 1 -FullSeconds 600 -Locked $false
+Assert { $s.Expired -eq $true -and $s.SecondsLeft -eq 0 }                "Unlocked at 1s: expires"
+
+$s = Get-CountdownStep -SecondsLeft 600 -FullSeconds 600 -Locked $true
+Assert { $s.SecondsLeft -eq 600 -and $s.Held -and -not $s.Expired }      "Locked at launch: held at the full length"
+
+$s = Get-CountdownStep -SecondsLeft 1 -FullSeconds 600 -Locked $true
+Assert { -not $s.Expired }                                               "Locked at 1s: does not expire"
+Assert { $s.SecondsLeft -eq 600 }                                        "Locked mid-countdown: reset to the full length"
+
+# 2026-11-17 scenario: the prompt opens on a locked screen and sits there for
+# far longer than the countdown. It must never expire while locked, and the
+# user must get the full countdown after unlocking.
+$left = 600; $expiredWhileLocked = $false
+foreach ($i in 1..3600) {
+    $s = Get-CountdownStep -SecondsLeft $left -FullSeconds 600 -Locked $true
+    if ($s.Expired) { $expiredWhileLocked = $true }
+    $left = $s.SecondsLeft
+}
+Assert { -not $expiredWhileLocked }                                      "An hour locked: never expires"
+$ticks = 0
+do {
+    $s = Get-CountdownStep -SecondsLeft $left -FullSeconds 600 -Locked $false
+    $left = $s.SecondsLeft; $ticks++
+} until ($s.Expired -or $ticks -gt 5000)
+Assert { $ticks -eq 600 }                                                "After unlock: expires after the full 600 ticks (was $ticks)"
+
+# A zero-length countdown keeps its old meaning (reboot on the first tick)
+# when unlocked, and still never fires on a locked session.
+$s = Get-CountdownStep -SecondsLeft 0 -FullSeconds 0 -Locked $false
+Assert { $s.Expired -eq $true }                                          "Zero-length countdown, unlocked: expires on the first tick"
+$s = Get-CountdownStep -SecondsLeft 0 -FullSeconds 0 -Locked $true
+Assert { -not $s.Expired }                                               "Zero-length countdown, locked: still held"
+
+# -------------------------------------------------------------------------
+
+Section "10. Session lock state"
+Assert { (Resolve-SessionLockState -ConnectState 0 -SessionFlags 0) -eq 'Locked' }    "Active + WTS_SESSIONSTATE_LOCK (0): Locked"
+Assert { (Resolve-SessionLockState -ConnectState 0 -SessionFlags 1) -eq 'Unlocked' }  "Active + WTS_SESSIONSTATE_UNLOCK (1): Unlocked"
+Assert { (Resolve-SessionLockState -ConnectState 0 -SessionFlags -1) -eq 'Unknown' }  "Active + WTS_SESSIONSTATE_UNKNOWN (-1): Unknown"
+Assert { (Resolve-SessionLockState -ConnectState 4 -SessionFlags 1) -eq 'Locked' }    "Disconnected session counts as Locked even if flagged unlocked"
+Assert { (Resolve-SessionLockState -ConnectState 0 -SessionFlags 7) -eq 'Unknown' }   "Unrecognized flag value: Unknown"
+
+# Live query: the answer depends on where the tests run (a CI runner has no
+# interactive desktop), so only the contract is asserted.
+$state = $null; $threw = $false
+try { $state = Get-SessionLockState } catch { $threw = $true }
+Assert { -not $threw }                                         "Get-SessionLockState does not throw"
+Assert { $state -in @('Locked', 'Unlocked', 'Unknown') }       "Get-SessionLockState returns a known state (was '$state')"
+Assert { (Test-SessionLocked) -is [bool] }                     "Test-SessionLocked returns a Boolean"
+Assert { (Test-SessionLocked) -eq ($state -eq 'Locked') }      "Test-SessionLocked is true only for 'Locked'"
+
+# 'Unknown' must not hold the countdown: an endpoint where detection is
+# broken would otherwise never auto-reboot.
+$script:sessionLockApiUnavailable = $true
+try {
+    Assert { (Get-SessionLockState) -eq 'Unknown' }            "Detection unavailable: Unknown"
+    Assert { (Test-SessionLocked) -eq $false }                 "Detection unavailable: not treated as locked"
+}
+finally {
+    $script:sessionLockApiUnavailable = $false
 }
 
 # -------------------------------------------------------------------------

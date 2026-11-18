@@ -8,7 +8,8 @@
 #      prompt task with a delayed first fire (a "recheck") so a reboot flag
 #      set by patching later in the same session still gets prompted; the
 #      prompt tears itself down if nothing turned up. Otherwise exit.
-#   2. If no interactive users: reboot immediately via Restart-ComputerAndWait.
+#   2. If no interactive users: reboot via shutdown.exe on the endpoint
+#      (not Restart-ComputerAndWait, which a Suppress session skips).
 #   3. Otherwise: stage immy-reboot-prompt.ps1 + a config file under
 #      C:\ProgramData\RebootPrompt and register a per-user scheduled task
 #      that runs the prompt at logon and every N hours until the user
@@ -21,7 +22,9 @@
 #   $postponeIntervalHours    - hours between re-prompts (default 24)
 #   $maxDefers                - max Postpone clicks before button is hidden
 #                               (default 3, 0 disables Postpone)
-#   $autoRebootAfterSeconds   - countdown in UI before auto-reboot (default 600)
+#   $autoRebootAfterSeconds   - countdown in UI before auto-reboot (default
+#                               600). Holds while the session is locked and
+#                               restarts from the top on unlock.
 #   $maxAutoReboots           - cap on consecutive AUTOMATIC reboots forced for a
 #                               pending state a reboot won't clear (default 2;
 #                               0 disables the loop guard). Explicit user
@@ -50,7 +53,7 @@
 # prompt transcript. Bump this on every release so a screenshot or log line
 # tells you exactly which build an endpoint is running. NOT an overridable
 # ImmyBot variable - it identifies the code, not a per-deployment setting.
-$scriptVersion = '1.1.7'
+$scriptVersion = '1.1.9'
 
 if ($null -eq $postponeIntervalHours)    { $postponeIntervalHours = 24 }
 if ($null -eq $maxDefers)                { $maxDefers = 3 }
@@ -110,7 +113,10 @@ $inlinedPromptScript = @'
 #     scheduled task and exit. A lone PFRO entry is not actionable.
 #   - Otherwise: show a window with Schedule / Reboot Now / Postpone, plus
 #     an auto-reboot countdown that fires shutdown /r /t 0 if the user
-#     never interacts.
+#     never interacts. The countdown only runs while the session is
+#     unlocked: it holds on a locked or disconnected session and restarts
+#     from the top on unlock, so nobody is rebooted by a warning they
+#     could not see.
 #
 # Postpone increments a per-user defer counter in HKCU; once $MaxDefers is
 # hit the Postpone button is hidden and the window's close (X) button is
@@ -429,6 +435,105 @@ $ShutdownAlreadyScheduledCode = 1190
 # /t greater than 0 implies /f.
 $ShutdownMachineLockedCode = 1271
 
+# -------------------------------------------------------------------------
+# Session lock state. The auto-reboot countdown is the user's warning, so it
+# must only run while someone can see it. On 2026-11-17 (D-TOBEFILLEDBYO) the
+# recheck prompt opened on a locked screen at 8:35 PM, counted down unseen,
+# and 1.1.7's /f retry force-rebooted the machine at 8:45 PM with unsaved
+# work open. Since 1.1.9 the countdown holds while the session is locked or
+# disconnected and restarts from the top on unlock.
+# -------------------------------------------------------------------------
+
+function Resolve-SessionLockState {
+    # Pure mapping from two WTSINFOEX_LEVEL1 fields to a state name, so it can
+    # be unit-tested without a locked session.
+    #   ConnectState: WTS_CONNECTSTATE_CLASS (0 = WTSActive, 4 = WTSDisconnected)
+    #   SessionFlags: 0 = WTS_SESSIONSTATE_LOCK, 1 = WTS_SESSIONSTATE_UNLOCK,
+    #                 -1 = WTS_SESSIONSTATE_UNKNOWN
+    # A disconnected session (RDP window closed) counts as locked: nobody is
+    # looking at it, and shutdown.exe refuses it with the same 1271.
+    param(
+        [Parameter(Mandatory)] [int]$ConnectState,
+        [Parameter(Mandatory)] [int]$SessionFlags
+    )
+    if ($ConnectState -eq 4) { return 'Locked' }
+    if ($SessionFlags -eq 0) { return 'Locked' }
+    if ($SessionFlags -eq 1) { return 'Unlocked' }
+    return 'Unknown'
+}
+
+function Get-SessionLockState {
+    # Returns 'Locked', 'Unlocked' or 'Unknown' for the session this process
+    # runs in, via WTSQuerySessionInformation(WTSSessionInfoEx). Never throws:
+    # any failure (Add-Type blocked, API error) is 'Unknown', which the
+    # countdown treats as unlocked - shutdown.exe's own 1271 refusal is the
+    # backstop there. A failed Add-Type is remembered so a broken endpoint
+    # doesn't re-run the C# compiler on every one-second tick.
+    if ($script:sessionLockApiUnavailable) { return 'Unknown' }
+    try {
+        if (-not ('RebootPrompt.Wts' -as [type])) {
+            try {
+                Add-Type -Namespace RebootPrompt -Name Wts -ErrorAction Stop -MemberDefinition '
+[DllImport("wtsapi32.dll", SetLastError = true)]
+public static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytesReturned);
+[DllImport("wtsapi32.dll")]
+public static extern void WTSFreeMemory(IntPtr memory);
+'
+            } catch {
+                $script:sessionLockApiUnavailable = $true
+                return 'Unknown'
+            }
+        }
+        $buffer = [IntPtr]::Zero
+        $bytes  = 0
+        # WTS_CURRENT_SERVER_HANDLE = 0, WTS_CURRENT_SESSION = -1, WTSSessionInfoEx = 25.
+        if (-not [RebootPrompt.Wts]::WTSQuerySessionInformationW([IntPtr]::Zero, -1, 25, [ref]$buffer, [ref]$bytes)) {
+            return 'Unknown'
+        }
+        try {
+            # WTSINFOEXW is { DWORD Level; union Data }. The Level1 member
+            # holds LARGE_INTEGERs, so the union is 8-byte aligned on x86 and
+            # x64 alike: SessionId at 8, SessionState at 12, SessionFlags at 16.
+            if ($bytes -lt 20) { return 'Unknown' }
+            if ([Runtime.InteropServices.Marshal]::ReadInt32($buffer, 0) -ne 1) { return 'Unknown' }
+            $connectState = [Runtime.InteropServices.Marshal]::ReadInt32($buffer, 12)
+            $sessionFlags = [Runtime.InteropServices.Marshal]::ReadInt32($buffer, 16)
+        } finally {
+            [RebootPrompt.Wts]::WTSFreeMemory($buffer)
+        }
+        return (Resolve-SessionLockState -ConnectState $connectState -SessionFlags $sessionFlags)
+    } catch {
+        return 'Unknown'
+    }
+}
+
+function Test-SessionLocked {
+    # True only when the session is positively known to be locked or
+    # disconnected. 'Unknown' is not locked: holding forever on an endpoint
+    # where detection is broken would silently disable the auto-reboot.
+    return ((Get-SessionLockState) -eq 'Locked')
+}
+
+function Get-CountdownStep {
+    # One tick of the auto-reboot countdown. Pure, so the hold rule can be
+    # unit-tested without WPF or a locked session.
+    #   Locked:   held at the full length - once the user is back they get
+    #             the whole warning period, not whatever happened to be left
+    #             when they walked away.
+    #   Unlocked: one second elapses; Expired once it reaches zero.
+    # Returns @{ SecondsLeft = int; Held = bool; Expired = bool }.
+    param(
+        [Parameter(Mandatory)] [int]$SecondsLeft,
+        [Parameter(Mandatory)] [int]$FullSeconds,
+        [Parameter(Mandatory)] [bool]$Locked
+    )
+    if ($Locked) {
+        return @{ SecondsLeft = $FullSeconds; Held = $true; Expired = $false }
+    }
+    $next = $SecondsLeft - 1
+    return @{ SecondsLeft = $next; Held = $false; Expired = ($next -le 0) }
+}
+
 function Invoke-ShutdownExe {
     # Runs shutdown.exe with the given arguments and returns
     # @{ ExitCode = int; Output = string }. Never throws on a non-zero exit.
@@ -480,13 +585,19 @@ function Invoke-RebootRequest {
     # recording when we last asked for a reboot (diagnostic breadcrumb; see
     # the marker functions above - it no longer gates prompting).
     #
-    # On failure with -WriteSentinelOnFailure, drops a sentinel file so the
-    # next maintenance pass reboots as SYSTEM instead. That fallback is only
-    # appropriate for "Reboot Now" / auto-countdown; a Schedule failure
-    # shouldn't escalate to "reboot at next maintenance pass" because the
-    # user's intent was specifically a future time.
+    # On failure with -WriteSentinelOnFailure, drops a sentinel file recording
+    # the failed request. Since 1.1.8 the maintenance pass doesn't force a
+    # reboot on it (that took the user's choice away, and Suppress sessions
+    # skipped it anyway): it clears the sentinel and re-runs the episode, so
+    # the user is prompted again. Only "Reboot Now" / auto-countdown pass it;
+    # a failed Schedule is just reported in the window.
     #
-    # Returns @{ Success = bool; Output = string }.
+    # A locked session refuses an immediate request with 1271. Only an
+    # explicit user action passes -ForceIfLocked and retries with /f; without
+    # it the request is abandoned and reported as Locked - not a failure, so
+    # no sentinel - and the caller decides (the auto-countdown holds).
+    #
+    # Returns @{ Success = bool; Locked = bool; Output = string }.
     # CountTowardLoopGuard tags this as an AUTOMATIC, unattended reboot (the
     # auto-countdown) so it increments the reboot ledger. Explicit user actions
     # (Reboot Now / Schedule) deliberately don't pass it - a user who keeps
@@ -494,6 +605,7 @@ function Invoke-RebootRequest {
     param(
         [int]$DelaySeconds = 0,
         [string]$Comment   = '',
+        [switch]$ForceIfLocked,
         [switch]$WriteSentinelOnFailure,
         [string]$SentinelPath,
         [string]$PostRebootMarkerPath,
@@ -516,11 +628,17 @@ function Invoke-RebootRequest {
         Write-Host "shutdown /a exit $($abort.ExitCode)."
         $r = Invoke-ShutdownExe -Arguments $shutdownArgs
     }
-    # 1271: the session is locked. The auto-countdown typically expires on a
-    # locked screen (the prompt fired while the user was away), and without
-    # /f the reboot is refused (2026-11-03, D-TOBEFILLEDBYO). The countdown
-    # was the user's warning, so force it. Retry once only.
+    # 1271: the session is locked, and without /f the reboot is refused
+    # (2026-11-03, D-TOBEFILLEDBYO). 1.1.7 always retried with /f on the
+    # theory that the countdown had been the user's warning - but a countdown
+    # on a locked screen warns nobody (2026-11-17: forced reboot with unsaved
+    # work open). So only force when the caller says a person asked for this
+    # reboot. Retry once only.
     if ($r.ExitCode -eq $ShutdownMachineLockedCode) {
+        if (-not $ForceIfLocked) {
+            Write-Host "shutdown.exe reports the machine is locked (exit $($r.ExitCode)); not forcing a reboot on a locked session."
+            return @{ Success = $false; Locked = $true; Output = $r.Output }
+        }
         Write-Host "shutdown.exe reports the machine is locked (exit $($r.ExitCode)); retrying with /f."
         $shutdownArgs += '/f'
         $r = Invoke-ShutdownExe -Arguments $shutdownArgs
@@ -538,7 +656,7 @@ function Invoke-RebootRequest {
         if ($DelaySeconds -le 0 -and $CountTowardLoopGuard -and $RebootLedgerPath) {
             try { Add-RebootAttempt -Path $RebootLedgerPath -WindowHours $LoopWindowHours -NowUtc (Get-Date).ToUniversalTime() | Out-Null } catch { }
         }
-        return @{ Success = $true; Output = '' }
+        return @{ Success = $true; Locked = $false; Output = '' }
     }
 
     $outputText = $r.Output
@@ -557,7 +675,7 @@ function Invoke-RebootRequest {
             Set-Content -Path $effectiveSentinel -Value "$stamp $env:USERNAME requested reboot; shutdown.exe exit $exitCode" -Encoding UTF8
         } catch { }
     }
-    return @{ Success = $false; Output = $outputText }
+    return @{ Success = $false; Locked = $false; Output = $outputText }
 }
 
 function Get-ScheduleOptions {
@@ -796,46 +914,80 @@ if ($atCap -or $maxDefers -le 0) {
 # Behavior
 # -------------------------------------------------------------------------
 
-$script:secondsLeft = [int]$config.AutoRebootAfterSeconds
-$script:allowClose  = $false
+$script:fullCountdownSeconds = [int]$config.AutoRebootAfterSeconds
+$script:secondsLeft          = $script:fullCountdownSeconds
+$script:countdownHeld        = $false
+$script:allowClose           = $false
 
 function Format-Countdown([int]$seconds) {
     "This computer will reboot automatically in $([TimeSpan]::FromSeconds($seconds).ToString('m\:ss'))"
 }
 $countdownText.Text = Format-Countdown $script:secondsLeft
 
+# Resolve the lock state once before the window opens: it records in the
+# transcript whether anyone could see this prompt, and it gets the one-time
+# P/Invoke compile out of the way so the first tick doesn't stall the UI.
+Write-Host "Session lock state at launch: $(Get-SessionLockState)."
+
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.add_Tick({
-    $script:secondsLeft--
-    if ($script:secondsLeft -le 0) {
-        $timer.Stop()
-        $script:allowClose = $true
-        Write-Host "Auto-reboot countdown expired; requesting immediate reboot."
-        # Auto-reboot path: best-effort. If shutdown fails, the sentinel file
-        # written inside Invoke-RebootRequest tells the next maintenance pass
-        # to reboot as SYSTEM. Either way, close the window. This is the
-        # unattended path, so it counts toward the reboot-loop guard.
-        $result = Invoke-RebootRequest -DelaySeconds 0 `
-            -WriteSentinelOnFailure `
-            -SentinelPath $sentinelPath `
-            -PostRebootMarkerPath $postRebootMarkerPath `
-            -CountTowardLoopGuard `
-            -RebootLedgerPath $rebootLedgerPath `
-            -LoopWindowHours $rebootLoopWindowHours
-        # Only retire the task once the reboot is actually under way, as Reboot
-        # Now does. On failure it stays registered and re-prompts at the next
-        # interval / logon instead of going silent until the next maintenance
-        # pass (once 1.1.6's delete grant made Remove-SelfTask succeed, an
-        # early removal left the user unprompted for a week).
-        if ($result.Success) {
-            Clear-DeferralState
-            Remove-SelfTask
+    # The countdown only runs while the session is unlocked (see
+    # Get-CountdownStep). Log each hold / release so the transcript shows
+    # how long the prompt sat unseen.
+    $step = Get-CountdownStep -SecondsLeft $script:secondsLeft `
+        -FullSeconds $script:fullCountdownSeconds `
+        -Locked (Test-SessionLocked)
+    if ($step.Held -ne $script:countdownHeld) {
+        if ($step.Held) {
+            Write-Host "Session locked; holding the auto-reboot countdown until it is unlocked."
+        } else {
+            Write-Host "Session unlocked; auto-reboot countdown restarted at $($script:fullCountdownSeconds)s."
         }
-        $window.Close()
-    } else {
-        $countdownText.Text = Format-Countdown $script:secondsLeft
+        $script:countdownHeld = $step.Held
     }
+    $script:secondsLeft = $step.SecondsLeft
+    if (-not $step.Expired) {
+        $countdownText.Text = Format-Countdown $script:secondsLeft
+        return
+    }
+
+    $timer.Stop()
+    Write-Host "Auto-reboot countdown expired; requesting immediate reboot."
+    # Auto-reboot path: best-effort, and never forced on a locked session
+    # (no -ForceIfLocked). This is the unattended path, so it counts toward
+    # the reboot-loop guard.
+    $result = Invoke-RebootRequest -DelaySeconds 0 `
+        -WriteSentinelOnFailure `
+        -SentinelPath $sentinelPath `
+        -PostRebootMarkerPath $postRebootMarkerPath `
+        -CountTowardLoopGuard `
+        -RebootLedgerPath $rebootLedgerPath `
+        -LoopWindowHours $rebootLoopWindowHours
+    if ($result.Locked) {
+        # Backstop for a lock the detection above missed ('Unknown' state, or
+        # the user locked in the final second): shutdown.exe itself says the
+        # session is locked. Keep the window and start the countdown over
+        # rather than rebooting under a warning nobody saw.
+        Write-Host "Session is locked at countdown expiry; restarting the countdown instead of rebooting."
+        $script:secondsLeft = $script:fullCountdownSeconds
+        $countdownText.Text = Format-Countdown $script:secondsLeft
+        $timer.Start()
+        return
+    }
+    # If shutdown failed for any other reason the task stays registered and
+    # re-prompts at the next interval / logon. Either way, close the window.
+    $script:allowClose = $true
+    # Only retire the task once the reboot is actually under way, as Reboot
+    # Now does. On failure it stays registered and re-prompts at the next
+    # interval / logon instead of going silent until the next maintenance
+    # pass (once 1.1.6's delete grant made Remove-SelfTask succeed, an
+    # early removal left the user unprompted for a week).
+    if ($result.Success) {
+        Clear-DeferralState
+        Remove-SelfTask
+    }
+    $window.Close()
 })
 
 $rebootNowBtn.add_Click({
@@ -849,7 +1001,10 @@ $rebootNowBtn.add_Click({
         'YesNo', 'Question')
     if ($confirm -ne 'Yes') { $timer.Start(); return }
     Write-Host "User chose Reboot Now."
+    # -ForceIfLocked: a person just confirmed this reboot, so a 1271 refusal
+    # is retried with /f. The auto-countdown never passes it.
     $result = Invoke-RebootRequest -DelaySeconds 0 `
+        -ForceIfLocked `
         -WriteSentinelOnFailure `
         -SentinelPath $sentinelPath `
         -PostRebootMarkerPath $postRebootMarkerPath
@@ -861,7 +1016,7 @@ $rebootNowBtn.add_Click({
     } else {
         [System.Windows.MessageBox]::Show(
             $window,
-            "Could not start the reboot:`n$($result.Output)`n`nThe request has been logged and will be carried out by the next maintenance pass.",
+            "Could not start the reboot:`n$($result.Output)`n`nPlease restart from the Start menu when you can. Otherwise you'll be reminded again later.",
             $config.Title, 'OK', 'Warning') | Out-Null
         $timer.Start()
     }
@@ -1362,6 +1517,38 @@ function Invoke-UnattendedRebootLedgerCheck {
     }
 }
 
+function Invoke-EndpointReboot {
+    # Reboots the endpoint with shutdown.exe as SYSTEM. Deliberately NOT
+    # Restart-ComputerAndWait: that honors the session's reboot preference
+    # and is a silent no-op ("Skipping Restart") under Suppress, which is
+    # exactly the kind of session this task exists to cover. The short delay
+    # lets ImmyBot collect this script's output before the machine goes down.
+    # /f because nobody is logged in to save anything, and a locked/
+    # disconnected session would otherwise refuse with 1271. A queued
+    # countdown (1190) is aborted and replaced once, as the prompt does.
+    param([int]$DelaySeconds = 60)
+    Invoke-ImmyCommand -Context System -ScriptBlock {
+        $delay = [int]$using:DelaySeconds
+        $shutdownArgs = @('/r', '/f', '/t', $delay, '/c', 'Restarting to finish installing updates.')
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & shutdown.exe @shutdownArgs 2>&1
+            $code = $LASTEXITCODE
+            if ($code -eq 1190) {
+                & shutdown.exe /a 2>&1 | Out-Null
+                $out = & shutdown.exe @shutdownArgs 2>&1
+                $code = $LASTEXITCODE
+            }
+        } finally { $ErrorActionPreference = $prevEap }
+        if ($code -eq 0) {
+            Write-Output "Reboot requested: shutdown /r /f /t $delay accepted."
+        } else {
+            Write-Output "Reboot request FAILED: shutdown.exe exit $code. $(($out | ForEach-Object { "$_" }) -join ' ')"
+        }
+    }
+}
+
 function Test-RebootDeferralPolicy {
     # Prerequisite probe: is Windows itself told to defer update reboots?
     # (README 'Prerequisite: Windows must defer reboots'.) Without a policy,
@@ -1492,24 +1679,24 @@ $config = @{
 
 $signals = Get-PendingRebootSignals
 
-# Reboot sentinel: if a prompt's user-context shutdown.exe failed (typically
-# SeShutdownPrivilege stripped by GPO), it dropped this flag for us to act on.
-# Only honor it while a reboot is actually still pending: a sentinel that
-# survived the reboot that resolved the episode (transient shutdown.exe
-# failure, manual restart) must not reboot a healthy machine. "Pending"
-# means CBS/WU, not PFRO: PFRO is routinely present after a reboot, so
-# gating on $signals.Any would force a second, pointless reboot. A sentinel
-# that fails this gate is cleared in the non-actionable branch below.
+# Reboot sentinel: a prompt's user-context shutdown.exe failed (locked
+# session, SeShutdownPrivilege stripped by GPO, ...) and dropped this flag.
+# Before 1.1.8 this pass then force-rebooted via Restart-ComputerAndWait,
+# which (a) takes the user's Schedule/Postpone choice away and (b) is a
+# no-op under a Suppress session reboot preference - on 2026-11-10 it
+# logged "Skipping Restart" after deleting the sentinel, so the reboot was
+# silently dropped. Now the sentinel only resets the episode: clear it (and
+# any scheduled-reboot flag from the failed attempt) and fall through, so
+# logged-in users get the prompt again and an unattended machine reboots
+# via the no-user path below. A sentinel with no CBS/WU pending is cleared
+# in the non-actionable branch.
 $sentinelExists = Invoke-ImmyCommand -Context System -ScriptBlock { Test-Path $using:sentinelPath }
 if ($sentinelExists -and (Test-ActionablePendingReboot -Signals $signals)) {
-    Write-Host "Reboot sentinel found at $sentinelPath - user requested reboot but their shutdown.exe failed. Rebooting now."
+    Write-Host "Reboot sentinel found at $sentinelPath - a requested reboot failed. Clearing it and re-running the episode."
     Invoke-ImmyCommand -Context System -ScriptBlock {
-        Remove-Item -Path $using:sentinelPath         -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $using:scheduledFlagPath    -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $using:postRebootMarkerPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:sentinelPath      -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $using:scheduledFlagPath -Force -ErrorAction SilentlyContinue
     }
-    Restart-ComputerAndWait
-    return
 }
 
 if (-not (Test-ActionablePendingReboot -Signals $signals)) {
@@ -1627,7 +1814,7 @@ if ($users.Count -eq 0) {
         return
     }
     Write-Host "Pending reboot detected (CBS/WU) and no interactive users. Forced reboot $($decision.Count) of $maxAutoReboots. Rebooting now."
-    Restart-ComputerAndWait
+    Invoke-EndpointReboot | ForEach-Object { Write-Host $_ }
     return
 }
 
